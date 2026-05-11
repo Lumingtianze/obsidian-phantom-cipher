@@ -1,0 +1,20 @@
+export default {
+    MODE: "运行模式",
+    MODE_DESC: "仅读取：保持原状；自动加密：保存即加密；自动还原：保存即解密。",
+    MODE_NONE: "仅读取",
+    MODE_ENCRYPT: "自动加密",
+    MODE_DECRYPT: "自动还原",
+    SECRET_NAME: "密码标识符",
+    SECRET_NAME_DESC: "系统钥匙串中存储密码的 Key 名称。",
+    MASTER_KEY: "设置主密码",
+    MASTER_KEY_DESC: "从系统钥匙串中选择加密主密码",
+    RIBBON_TEXT: "加密/还原转换",
+    MENU_TEXT: "加密/还原转换",
+    STATUS_TRANSPARENT: " 透明中",
+    STATUS_LOCKED: " 已锁定",
+    NOTICE_SET_PASSWORD: "请先设置主密码",
+    NOTICE_RESTORED: "✅ {{name}} 已还原",
+    NOTICE_ENCRYPTED: "🔒 {{name}} 已加密",
+    NOTICE_FAILED: "🔑 {{name}} 转换失败，请检查密码",
+    ERROR_DECRYPT: "❌ {{name}} 解密失败：主密码错误或密文数据损坏"
+};

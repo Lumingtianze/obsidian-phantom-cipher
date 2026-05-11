@@ -1,0 +1,20 @@
+export default {
+    MODE: "Operation Mode",
+    MODE_DESC: "Read-only: Keep original; Auto-encrypt: Encrypt on save; Auto-decrypt: Decrypt on save.",
+    MODE_NONE: "Read-only",
+    MODE_ENCRYPT: "Auto-encrypt",
+    MODE_DECRYPT: "Auto-decrypt",
+    SECRET_NAME: "Secret Identifier",
+    SECRET_NAME_DESC: "The key name used to store the password in the system keychain.",
+    MASTER_KEY: "Set Master Password",
+    MASTER_KEY_DESC: "Select the encryption master password from the system keychain.",
+    RIBBON_TEXT: "Toggle Encryption/Restoration",
+    MENU_TEXT: "Toggle Encryption/Restoration",
+    STATUS_TRANSPARENT: " Transparent",
+    STATUS_LOCKED: " Locked",
+    NOTICE_SET_PASSWORD: "Please set the master password first.",
+    NOTICE_RESTORED: "✅ {{name}} Restored",
+    NOTICE_ENCRYPTED: "🔒 {{name}} Encrypted",
+    NOTICE_FAILED: "🔑 {{name}} Conversion failed, please check your password.",
+    ERROR_DECRYPT: "❌ {{name}} Decryption failed: Incorrect master password or corrupted data."
+};

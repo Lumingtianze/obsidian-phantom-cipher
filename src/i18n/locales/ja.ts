@@ -1,0 +1,20 @@
+export default {
+    MODE: "動作モード",
+    MODE_DESC: "読み取り専用：現状維持。自動暗号化：保存時に暗号化。自動復元：保存時に復号。",
+    MODE_NONE: "読み取り専用",
+    MODE_ENCRYPT: "自動暗号化",
+    MODE_DECRYPT: "自動復元",
+    SECRET_NAME: "パスワード識別子",
+    SECRET_NAME_DESC: "システムキーチェーンにパスワードを保存するためのキー名。",
+    MASTER_KEY: "マスターパスワードの設定",
+    MASTER_KEY_DESC: "システムキーチェーンから暗号化マスターパスワードを選択します。",
+    RIBBON_TEXT: "暗号化/復元の切り替え",
+    MENU_TEXT: "暗号化/復元の切り替え",
+    STATUS_TRANSPARENT: " 透過中",
+    STATUS_LOCKED: " ロック済み",
+    NOTICE_SET_PASSWORD: "最初にマスターパスワードを設定してください。",
+    NOTICE_RESTORED: "✅ {{name}} 復元済み",
+    NOTICE_ENCRYPTED: "🔒 {{name}} 暗号化済み",
+    NOTICE_FAILED: "🔑 {{name}} 変換に失敗しました。パスワードを確認してください。",
+    ERROR_DECRYPT: "❌ {{name}} 復号失敗：マスターパスワードが間違っているか、データが破損しています。"
+};
