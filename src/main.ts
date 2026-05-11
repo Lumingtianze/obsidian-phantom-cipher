@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, setIcon, arrayBufferToBase64, base64ToArrayBuffer } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Stat, MarkdownView } from 'obsidian';
 import { argon2id } from 'hash-wasm';
 import { i18n } from './i18n/helpers';
 
@@ -26,7 +26,20 @@ const SALT_SIZE = 16;
 const IV_SIZE = 12;
 
 // 预设不进行二次压缩的文件类型列表
-const NON_COMPRESSIBLE = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'pdf']);
+const NON_COMPRESSIBLE = new Set([
+	'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', // 图片
+	'pdf', // 文档
+	'mp3', 'ogg', 'opus', 'm4a', 'flac', 'aac', // 音频
+	'mp4', 'webm', 'ogv', 'mov', 'mkv' // 视频
+]);
+
+// 支持预览的文件类型列表
+const PREVIEW_SUPPORTED = new Set([
+	'png', 'jpg', 'jpeg', 'gif', 'bmp', 'svg', 'webp', 'avif', // 图片
+	'pdf', // 文档
+	'mp3', 'ogg', 'opus', 'm4a', 'flac', 'aac', 'wav', // 音频
+	'mp4', 'webm', 'ogv', 'mov', 'mkv' // 视频
+]);
 
 class CryptoHelper {
 	// 缓存密钥：使用过的密钥自动缓存
@@ -77,7 +90,7 @@ class CryptoHelper {
 			const result = await argon2id({
 				password, salt: saltArr, iterations: 3, memorySize: 65536, parallelism: 4, hashLength: 32, outputType: 'binary'
 			});
-			const derivedKey = await crypto.subtle.importKey("raw", this.toBuffer(result as Uint8Array), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+			const derivedKey = await crypto.subtle.importKey("raw", this.toBuffer(result as Uint8Array), { name: "AES-GCM" }, false,["encrypt", "decrypt"]);
 			this.keyMapCache.set(cacheKey, derivedKey);
 			return derivedKey;
 		})();
@@ -170,9 +183,16 @@ export default class PhantomCipherPlugin extends Plugin {
 	private originalWrite: any;
 	private originalReadBinary: any;
 	private originalWriteBinary: any;
+	private originalProcess: any;
+	private originalStat: any;
+	private originalGetResourcePath: any;
+	private originalCachedRead: any;
 	private statusBarItem!: HTMLElement;
 
 	private errorThrottler: Map<string, number> = new Map();
+	// 缓存已解密文件的大小 (Size) 和 Blob URL，确保编辑器和媒体加载正常
+	private decryptedSizeCache: Map<string, number> = new Map();
+	private blobUrlCache: Map<string, string> = new Map();
 
 	async onload() {
 		await this.loadSettings();
@@ -201,19 +221,30 @@ export default class PhantomCipherPlugin extends Plugin {
 		this.originalWrite = adapter.write.bind(adapter);
 		this.originalReadBinary = adapter.readBinary.bind(adapter);
 		this.originalWriteBinary = adapter.writeBinary.bind(adapter);
+		this.originalProcess = adapter.process.bind(adapter);
+		this.originalStat = adapter.stat.bind(adapter);
+		this.originalGetResourcePath = adapter.getResourcePath.bind(adapter);
+		this.originalCachedRead = this.app.vault.cachedRead.bind(this.app.vault);
 
 		this.hookAdapter();
 		this.addSettingTab(new CryptoSettingTab(this.app, this));
 
-		// 注册文件打开与修改的状态栏更新事件
+		// 监听文件打开、修改、以及元数据更新（处理启动时的索引延迟）
 		this.registerEvent(this.app.workspace.on('file-open', (file) => this.updateStatusBar(file)));
 		this.registerEvent(this.app.vault.on('modify', (file) => {
 			if (file instanceof TFile && file === this.app.workspace.getActiveFile()) this.updateStatusBar(file);
 		}));
+        this.registerEvent(this.app.metadataCache.on('changed', (file) => {
+            if (file === this.app.workspace.getActiveFile()) this.updateStatusBar(file);
+        }));
 
-		this.app.workspace.onLayoutReady(() => {
-			this.fetchPassword();
-			this.updateStatusBar(this.app.workspace.getActiveFile());
+		this.app.workspace.onLayoutReady(async () => {
+			await this.fetchPassword();
+            // 延迟 500ms 待视图稳定后执行初次预热
+            setTimeout(() => {
+                const activeFile = this.app.workspace.getActiveFile();
+                if (activeFile) this.updateStatusBar(activeFile);
+            }, 500);
 		});
 	}
 
@@ -224,6 +255,12 @@ export default class PhantomCipherPlugin extends Plugin {
 		adapter.write = this.originalWrite;
 		adapter.readBinary = this.originalReadBinary;
 		adapter.writeBinary = this.originalWriteBinary;
+		adapter.stat = this.originalStat;
+		adapter.process = this.originalProcess;
+		this.app.vault.cachedRead = this.originalCachedRead;
+		this.blobUrlCache.forEach(url => URL.revokeObjectURL(url));
+		this.blobUrlCache.clear();
+		this.decryptedSizeCache.clear();
 		this.crypto.clearCache();
 	}
 
@@ -248,7 +285,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		const lowStack = stack.toLowerCase();
 
 		// 已知同步类插件的 ID 或核心关键词
-		const syncBlacklist = [
+		const syncBlacklist =[
 			"remotely-save", 
 			"livesync", 
 		];
@@ -267,6 +304,23 @@ export default class PhantomCipherPlugin extends Plugin {
 	}
 
 	/**
+	 * 根据扩展名获取精确的 MIME 类型，用于 Blob URL 预览
+	 */
+	private getMimeType(ext: string): string {
+		const map: Record<string, string> = {
+			'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+			'pdf': 'application/pdf',
+			'mp4': 'video/mp4', 'mkv': 'video/x-matroska',
+			'mov': 'video/quicktime', 'm4a': 'audio/mp4',
+			'mp3': 'audio/mpeg', 'svg': 'image/svg+xml'
+		};
+		if (map[ext]) return map[ext];
+		if (['png', 'gif', 'webp', 'avif', 'bmp'].includes(ext)) return `image/${ext}`;
+		if (['webm', 'wav', 'ogg', 'opus', 'flac'].includes(ext)) return `audio/${ext}`;
+		return 'application/octet-stream';
+	}
+
+	/**
 	 * 核心 Hook 逻辑：接管读取与写入流程
 	 */
 	private hookAdapter() {
@@ -280,7 +334,7 @@ export default class PhantomCipherPlugin extends Plugin {
 			const now = Date.now();
 			const lastTime = self.errorThrottler.get(path) || 0;
 
-			if (now - lastTime > 2000) {
+			if (now - lastTime > 3000) {
 				new Notice(errorMsg);
 				self.errorThrottler.set(path, now);
 			}
@@ -288,28 +342,68 @@ export default class PhantomCipherPlugin extends Plugin {
 			throw new Error(errorMsg);
 		};
 
+		// 拦截资源路径。如果是加密媒体文件，返回解密后的 Blob URL。
+		adapter.getResourcePath = (path: string): string => {
+			if (self.blobUrlCache.has(path)) return self.blobUrlCache.get(path)!;
+			return self.originalGetResourcePath(path);
+		};
+
+		// 拦截 Stat 接口。编辑器会根据 Stat 返回的 size 校验 changeset。
+		// 如果检测到是加密文件且由非同步插件访问，返回已记录的解密后大小。
+		adapter.stat = async (path: string): Promise<Stat | null> => {
+			const stat = await self.originalStat(path);
+			if (!stat || path.includes(".obsidian") || self.isSyncCaller()) return stat;
+			if (self.decryptedSizeCache.has(path)) {
+				stat.size = self.decryptedSizeCache.get(path)!;
+			}
+			return stat;
+		};
+
+		// 拦截 CachedRead，确保 Obsidian 内部缓存系统拿到的是解密后的明文
+		this.app.vault.cachedRead = async (file: TFile): Promise<string> => {
+			const content = await self.originalRead(file.path);
+			if (file.path.includes(".obsidian") || !self.crypto.isEncrypted(content) || self.isSyncCaller()) return content;
+			if (!self.rawPassword) await self.fetchPassword();
+			const decrypted = await self.crypto.decrypt(content, self.rawPassword || "");
+			if (decrypted) return new TextDecoder().decode(decrypted);
+			return handleCryptoError(file.path);
+		};
+
 		// 处理文本读取：如果是加密文件则自动解密
 		adapter.read = async (path: string): Promise<string> => {
 			const content = await self.originalRead(path);
 			if (path.includes(".obsidian") || !self.crypto.isEncrypted(content) || self.isSyncCaller()) return content;
 			if (!self.rawPassword) await self.fetchPassword();
-			try {
-				const decrypted = await self.crypto.decrypt(content, self.rawPassword || "");
-				return decrypted ? new TextDecoder().decode(decrypted) : content;
-			} catch (e) { return handleCryptoError(path); }
+			const decrypted = await self.crypto.decrypt(content, self.rawPassword || "");
+			if (decrypted) {
+				const text = new TextDecoder().decode(decrypted);
+				self.decryptedSizeCache.set(path, text.length); // 记录文本长度
+				return text;
+			}
+			return handleCryptoError(path);
 		};
 
 		// 处理二进制读取：支持附件透明解密
 		adapter.readBinary = async (path: string): Promise<ArrayBuffer> => {
 			const data = await self.originalReadBinary(path);
-			if (path.includes(".obsidian") || !self.crypto.isEncrypted(data) || self.isSyncCaller()) return data;
+			if (path.includes(".obsidian") || !self.crypto.isEncrypted(data.slice(0, MAGIC_HEADER.length)) || self.isSyncCaller()) return data;
 
 			if (!self.rawPassword) await self.fetchPassword();
-			try {
-				const armoredText = new TextDecoder().decode(data);
-				const decrypted = await self.crypto.decrypt(armoredText, self.rawPassword || "");
-				return decrypted ? self.crypto["toBuffer"](decrypted) : data;
-			} catch (e) { return handleCryptoError(path); }
+			const armoredText = new TextDecoder().decode(data);
+			const decrypted = await self.crypto.decrypt(armoredText, self.rawPassword || "");
+			if (decrypted) {
+				self.decryptedSizeCache.set(path, decrypted.byteLength);
+				// 针对媒体文件生成 Blob URL，让 app:// 协议能显示加密图片
+				const ext = path.split('.').pop()?.toLowerCase() || '';
+				if (PREVIEW_SUPPORTED.has(ext)) {
+					if (self.blobUrlCache.has(path)) URL.revokeObjectURL(self.blobUrlCache.get(path)!);
+					// 生成 Blob URL 并映射，支持所有媒体格式预览
+					const blob = new Blob([decrypted as any], { type: self.getMimeType(ext) });
+					self.blobUrlCache.set(path, URL.createObjectURL(blob));
+				}
+				return self.crypto["toBuffer"](decrypted);
+			}
+			return handleCryptoError(path) as any;
 		};
 
 		/**
@@ -319,7 +413,7 @@ export default class PhantomCipherPlugin extends Plugin {
             if (path.includes(".obsidian") || self.isSyncCaller()) return data; // 同步插件写入时直接透传密文，不触发二次加密
             if (!self.rawPassword) await self.fetchPassword();
 
-			// 性能优化：头部预检。仅读取前 10 字节判断文件是否原本就是加密状态。
+			// 仅读取前 10 字节判断文件是否原本直接就是加密状态
 			let isCurrentlyEncrypted = false;
 			try {
 				const head = await self.originalReadBinary(path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
@@ -330,15 +424,13 @@ export default class PhantomCipherPlugin extends Plugin {
 			const shouldCompress = !NON_COMPRESSIBLE.has(ext);
 
 			// 模式判定逻辑
-			if (self.settings.mode === 'encrypt' && self.rawPassword) {
-				return await self.crypto.encrypt(data, self.rawPassword, shouldCompress);
-			}
-			if (self.settings.mode === 'decrypt') return data;
-
 			// 如果是非强制模式，根据头部的探测结果决定是否加密
-			if (isCurrentlyEncrypted && self.rawPassword) {
-				return await self.crypto.encrypt(data, self.rawPassword, shouldCompress);
+			if ((self.settings.mode === 'encrypt' || isCurrentlyEncrypted) && self.settings.mode !== 'decrypt' && self.rawPassword) {
+				const encrypted = await self.crypto.encrypt(data, self.rawPassword, shouldCompress);
+				self.decryptedSizeCache.set(path, data.byteLength); // 更新长度缓存
+				return encrypted;
 			}
+			self.decryptedSizeCache.set(path, data.byteLength);
 			return data;
 		};
 
@@ -351,6 +443,64 @@ export default class PhantomCipherPlugin extends Plugin {
 			const result = await handleWrite(path, new Uint8Array(data));
 			return typeof result === 'string' ? await self.originalWrite(path, result, options) : await self.originalWriteBinary(path, data, options);
 		};
+
+		adapter.process = async (path: string, fn: (data: string) => string, options?: DataWriteOptions): Promise<string> => {
+			const content = await adapter.read(path);
+			const processed = fn(content);
+			await adapter.write(path, processed, options);
+			return processed;
+		};
+	}
+
+	/**
+	 * 预热逻辑：解密文件并存入 Blob 缓存。
+	 */
+	private async warmupFile(file: TFile): Promise<boolean> {
+		const path = file.path;
+		if (this.blobUrlCache.has(path)) return true;
+		try {
+			const rawHead = await this.originalReadBinary(path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+			if (this.crypto.isEncrypted(rawHead) && this.rawPassword) {
+				// 调用 readBinary 触发 Hook，生成并记录 Blob URL
+				await this.app.vault.readBinary(file);
+				return true;
+			}
+		} catch (e) {}
+		return false;
+	}
+
+	/**
+	 * 视图更新逻辑
+	 */
+	private fixMediaDOM() {
+		// 查找所有受支持的媒体节点
+		const mediaElements = document.querySelectorAll('img, video, audio, source');
+		if (mediaElements.length === 0) return;
+
+		this.blobUrlCache.forEach((blobUrl, path) => {
+			// 获取由 Obsidian 原生生成的原始 URL
+			const originalUrlBase = this.originalGetResourcePath(path).split('?')[0];
+			// 回退匹配：处理可能出现的标准 URL 编码格式
+			const encodedPath = encodeURIComponent(path).replace(/%2F/g, '/');
+
+			mediaElements.forEach((el) => {
+				const src = el.getAttribute('src');
+				// 如果标签还没挂载或者已经是 blob 了，跳过
+				if (!src || src.startsWith('blob:')) return;
+
+				// Obsidian 会追加 ? 参数缓存修饰，只对比基础路径
+				const srcBase = src.split('?')[0];
+				
+				// 匹配上了残留的本地物理路径，说明浏览器之前请求失败了，直接通过 DOM 更新替换为 Blob
+				if (srcBase && (srcBase === originalUrlBase || srcBase.endsWith(path) || srcBase.endsWith(encodedPath))) {
+					el.setAttribute('src', blobUrl);
+					// 对于视频或音频播放器，需要调起重新加载流
+					if (el instanceof HTMLMediaElement) {
+						el.load();
+					}
+				}
+			});
+		});
 	}
 
 	/**
@@ -359,9 +509,10 @@ export default class PhantomCipherPlugin extends Plugin {
 	private async updateStatusBar(file: TFile | null) {
 		if (!file) { this.statusBarItem.style.display = "none"; return; }
 		try {
-			// 仅读取前几个字节检查状态
-			const head = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
-			const isEnc = this.crypto.isEncrypted(head);
+			// 1. 物理状态检查（仅用于状态标展示）
+			const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+			const isEnc = this.crypto.isEncrypted(rawHead);
+			
 			this.statusBarItem.empty();
 			if (isEnc) {
 				this.statusBarItem.style.display = "inline-block";
@@ -372,6 +523,35 @@ export default class PhantomCipherPlugin extends Plugin {
 			} else {
 				this.statusBarItem.style.display = "none";
 			}
+
+			// 2. 预热任务队列：不论笔记本身是否加密，都要预热其中的媒体
+			const warmupTasks: Promise<boolean>[] =[];
+			
+			// 如果当前文件本身就是可预览的媒体（如直接打开图片/PDF），先预热它
+			if (PREVIEW_SUPPORTED.has(file.extension.toLowerCase())) {
+				warmupTasks.push(this.warmupFile(file));
+			}
+
+			// 扫描 Markdown 中的所有双链嵌入附件 (Images/PDFs/Videos)
+			const cache = this.app.metadataCache.getFileCache(file);
+			if (cache?.embeds) {
+				for (const embed of cache.embeds) {
+					const embedFile = this.app.metadataCache.getFirstLinkpathDest(embed.link, file.path);
+					if (embedFile instanceof TFile) {
+						warmupTasks.push(this.warmupFile(embedFile));
+					}
+				}
+			}
+
+			// 3. 阻塞等待：确保所有相关的加密附件都已解密并生成 Blob URL
+			if (warmupTasks.length > 0) {
+				const results = await Promise.all(warmupTasks);
+				// 如果产生了任何一个新解密的映射，触发 DOM 重载以修复媒体错位。
+				if (results.some(r => r)) {
+					this.fixMediaDOM();
+				}
+			}
+
 		} catch (e) { this.statusBarItem.style.display = "none"; }
 	}
 
