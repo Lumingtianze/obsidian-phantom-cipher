@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Stat, MarkdownView } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, TFolder, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Stat, MarkdownView } from 'obsidian';
 import { argon2id } from 'hash-wasm';
 import { i18n } from './i18n/helpers';
 
@@ -209,10 +209,18 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		// 绑定右键菜单项
 		this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {
-			if (!(file instanceof TFile)) return;
-			menu.addItem((item) => {
-				item.setTitle(i18n.t('MENU_TEXT')).setIcon("key").onClick(() => this.manuallyToggleFile(file));
-			});
+			if (file instanceof TFile) {
+				menu.addItem((item) => {
+					item.setTitle(i18n.t('MENU_TEXT')).setIcon("key").onClick(() => this.manuallyToggleFile(file));
+				});
+			} else if (file instanceof TFolder) {
+				menu.addItem((item) => {
+					item.setTitle(i18n.t('MENU_BATCH_ENCRYPT')).setIcon("lock").onClick(() => this.batchProcessFolder(file, 'encrypt'));
+				});
+				menu.addItem((item) => {
+					item.setTitle(i18n.t('MENU_BATCH_DECRYPT')).setIcon("unlock").onClick(() => this.batchProcessFolder(file, 'decrypt'));
+				});
+			}
 		}));
 
 		// 拦截并备份原生的 Adapter 方法
@@ -581,6 +589,62 @@ export default class PhantomCipherPlugin extends Plugin {
 		await this.updateStatusBar(file);
 	}
 
+	/**
+	 * 批量处理文件夹下的加解密逻辑
+	 * 采用底层安全旁路执行，通过读取/写入底层原生的 adapter API 绕开 Hook，防止死循环。
+	 */
+	private async batchProcessFolder(folder: TFolder, action: 'encrypt' | 'decrypt') {
+		if (!this.rawPassword) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
+		
+		// 递归获取所有属于此文件夹的文件
+		const allFiles = this.app.vault.getFiles();
+		const targetFiles = folder.path === '/' 
+			? allFiles 
+			: allFiles.filter(f => f.path.startsWith(folder.path + '/'));
+
+		let successCount = 0;
+		const isEncryptAction = action === 'encrypt';
+		
+		new Notice(i18n.t('NOTICE_BATCH_START', { count: targetFiles.length }));
+
+		for (const file of targetFiles) {
+			// 只处理 Markdown 和受支持的附件格式，跳过诸如 .obsidian 里的系统文件
+			if (file.extension === 'md' || PREVIEW_SUPPORTED.has(file.extension.toLowerCase()) || NON_COMPRESSIBLE.has(file.extension.toLowerCase())) {
+				try {
+					// 直接通过底层 Adapter 探查头信息判断状态
+					const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+					const isEnc = this.crypto.isEncrypted(rawHead);
+
+					if (isEncryptAction && !isEnc) {
+						// 批量加密操作：目标未加密，执行加密
+						const data = new Uint8Array(await this.originalReadBinary(file.path));
+						const ext = file.extension.toLowerCase();
+						const armored = await this.crypto.encrypt(data, this.rawPassword, !NON_COMPRESSIBLE.has(ext));
+						// 使用底层原始 Write，不触发 Hook 从而避免死锁
+						await this.originalWrite(file.path, armored);
+						successCount++;
+					} else if (!isEncryptAction && isEnc) {
+						// 批量解密操作：目标已加密，执行解密
+						const rawText = await this.originalRead(file.path);
+						const decrypted = await this.crypto.decrypt(rawText, this.rawPassword);
+						if (decrypted) {
+							// 使用底层原始 WriteBinary 还原明文
+							await this.originalWriteBinary(file.path, decrypted);
+							successCount++;
+						}
+					}
+				} catch (e) {
+					const actionName = isEncryptAction ? i18n.t('MODE_ENCRYPT') : i18n.t('MODE_DECRYPT');
+					console.error(i18n.t('LOG_BATCH_ERROR', { action: actionName, path: file.path }), e);
+				}
+			}
+		}
+
+		new Notice(i18n.t('NOTICE_BATCH_FINISH', { count: successCount }));
+		// 操作完成后强制刷新一次当前激活窗口的状态标
+		this.updateStatusBar(this.app.workspace.getActiveFile());
+	}
+
 	async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
 	async saveSettings() { await this.saveData(this.settings); }
 }
@@ -592,7 +656,7 @@ class CryptoSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		containerEl.createEl('h2', { text: 'PhantomCipher' });
+		containerEl.createEl('h2', { text: i18n.t('PLUGIN_NAME')});
 
 		new Setting(containerEl)
 			.setName(i18n.t('MODE'))

@@ -1,4 +1,5 @@
 export default {
+    PLUGIN_NAME: "PhantomCipher (幻影加密)",
     MODE: "运行模式",
     MODE_DESC: "仅读取：保持原状；自动加密：保存即加密；自动还原：保存即解密。",
     MODE_NONE: "仅读取",
@@ -10,11 +11,16 @@ export default {
     MASTER_KEY_DESC: "从系统钥匙串中选择加密主密码",
     RIBBON_TEXT: "加密/还原转换",
     MENU_TEXT: "加密/还原转换",
+    MENU_BATCH_ENCRYPT: "批量加密文件夹",
+    MENU_BATCH_DECRYPT: "批量还原文件夹",
     STATUS_TRANSPARENT: " 透明中",
     STATUS_LOCKED: " 已锁定",
     NOTICE_SET_PASSWORD: "请先设置主密码",
     NOTICE_RESTORED: "✅ {{name}} 已还原",
     NOTICE_ENCRYPTED: "🔒 {{name}} 已加密",
     NOTICE_FAILED: "🔑 {{name}} 转换失败，请检查密码",
-    ERROR_DECRYPT: "❌ {{name}} 解密失败：主密码错误或密文数据损坏"
+    NOTICE_BATCH_START: "🚀 开始批量处理... (共检索到 {{count}} 个文件)",
+    NOTICE_BATCH_FINISH: "✨ 批量处理完成！已成功转换 {{count}} 个文件。",
+    ERROR_DECRYPT: "❌ {{name}} 解密失败：主密码错误或密文数据损坏",
+    LOG_BATCH_ERROR: "PhantomCipher: 批量{{action}}文件失败 -> {{path}}"
 };
