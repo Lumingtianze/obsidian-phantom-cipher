@@ -22,5 +22,9 @@ export default {
     NOTICE_BATCH_START: "🚀 Starting batch process... ({{count}} files found)",
     NOTICE_BATCH_FINISH: "✨ Batch complete! Successfully converted {{count}} files.",
     ERROR_DECRYPT: "❌ Decryption failed for {{name}}: Incorrect master key or corrupted data",
-    LOG_BATCH_ERROR: "PhantomCipher: Failed to batch {{action}} file -> {{path}}"
+    LOG_BATCH_ERROR: "PhantomCipher: Failed to batch {{action}} file -> {{path}}",
+	LOG_ERR_CONVERSION: "PhantomCipher: Safe conversion failed for {{path}}",
+    ERR_VAL_ENC_CORRUPT: "Validation failed: Encrypted replica is corrupted or undecryptable",
+    ERR_VAL_DEC_MISMATCH: "Validation failed: Decrypted replica length mismatch",
+    ERR_MEM_DECRYPT: "In-memory decryption validation failed"
 };

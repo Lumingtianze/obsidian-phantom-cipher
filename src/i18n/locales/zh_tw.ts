@@ -22,5 +22,9 @@ export default {
     NOTICE_BATCH_START: "🚀 開始批量處理... (共檢索到 {{count}} 個文件)",
     NOTICE_BATCH_FINISH: "✨ 批量處理完成！已成功轉換 {{count}} 個文件。",
     ERROR_DECRYPT: "❌ {{name}} 解密失敗：主密碼錯誤或密文數據損壞",
-    LOG_BATCH_ERROR: "PhantomCipher: 批量{{action}}文件失敗 -> {{path}}"
+	LOG_BATCH_ERROR: "PhantomCipher: 批量{{action}}檔案失敗 -> {{path}}",
+    LOG_ERR_CONVERSION: "PhantomCipher: {{path}} 安全轉換失敗",
+    ERR_VAL_ENC_CORRUPT: "校驗失敗：加密副本損壞或無法解密",
+    ERR_VAL_DEC_MISMATCH: "校驗失敗：解密副本長度不匹配",
+    ERR_MEM_DECRYPT: "記憶體解密校驗失敗"
   }

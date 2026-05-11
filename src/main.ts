@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, TFolder, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Stat, MarkdownView } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, TFolder, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Stat, Platform } from 'obsidian';
 import { argon2id } from 'hash-wasm';
 import { i18n } from './i18n/helpers';
 
@@ -9,6 +9,7 @@ import { i18n } from './i18n/helpers';
  * 2. 压缩：内置 Deflate 压缩流，用于抵消 Base64 编码带来的体积膨胀。
  * 3. 透明：拦截 Vault Adapter 底层接口，实现用户无感知的加解密。
  * 4. 缓存：引入 Session Salt (会话盐) 机制，极大提升高频写入时的响应速度。
+ * 5. 内存保护：采用 XOR 内存混淆，防止密码明文在内存中长期驻留导致 Dump 泄露。
  */
 
 interface PhantomCipherSettings {
@@ -157,12 +158,19 @@ class CryptoHelper {
 	/**
 	 * 特征检测：识别字符串或二进制数据是否包含加密头
 	 */
-	isEncrypted(data: string | ArrayBuffer | null): boolean {
+	isEncrypted(data: string | ArrayBuffer | Uint8Array | null): boolean {
 		if (!data) return false;
 		if (typeof data === 'string') return data.startsWith(MAGIC_HEADER);
-		if (data.byteLength < MAGIC_HEADER.length) return false;
+		
+		let bytes: Uint8Array;
+		if (data instanceof Uint8Array) {
+			bytes = data;
+		} else {
+			bytes = new Uint8Array(data);
+		}
 
-		const bytes = new Uint8Array(data, 0, MAGIC_HEADER.length);
+		if (bytes.length < MAGIC_HEADER.length) return false;
+
 		let header = "";
 		for (let i = 0; i < MAGIC_HEADER.length; i++) header += String.fromCharCode(bytes[i]!);
 		return header === MAGIC_HEADER;
@@ -177,7 +185,10 @@ class CryptoHelper {
 export default class PhantomCipherPlugin extends Plugin {
 	settings!: PhantomCipherSettings;
 	crypto: CryptoHelper = new CryptoHelper();
-	rawPassword: string | null = null;
+	
+	// 内存混淆安全凭证
+	private memoryKey: Uint8Array | null = null;
+	private obfuscatedPassword: Uint8Array | null = null;
 
 	private originalRead: any;
 	private originalWrite: any;
@@ -190,9 +201,81 @@ export default class PhantomCipherPlugin extends Plugin {
 	private statusBarItem!: HTMLElement;
 
 	private errorThrottler: Map<string, number> = new Map();
+	private decryptedPaths: Set<string> = new Set(); // 追踪真正解密成功的路径
 	// 缓存已解密文件的大小 (Size) 和 Blob URL，确保编辑器和媒体加载正常
 	private decryptedSizeCache: Map<string, number> = new Map();
 	private blobUrlCache: Map<string, string> = new Map();
+
+	/**
+	 * 设置密码时，立刻使用随机数进行 XOR 混淆存储
+	 */
+	private setPassword(pwd: string | null) {
+		// 先擦除旧密码内存
+		if (this.obfuscatedPassword) this.obfuscatedPassword.fill(0);
+		if (this.memoryKey) this.memoryKey.fill(0);
+
+		if (!pwd) {
+			this.memoryKey = null;
+			this.obfuscatedPassword = null;
+			return;
+		}
+
+		const pwdBytes = new TextEncoder().encode(pwd);
+		const memKey = crypto.getRandomValues(new Uint8Array(pwdBytes.length));
+		const obfPwd = new Uint8Array(pwdBytes.length);
+		
+		for (let i = 0; i < pwdBytes.length; i++) {
+			obfPwd[i] = pwdBytes[i]! ^ memKey[i]!;
+		}
+		
+		this.memoryKey = memKey;
+		this.obfuscatedPassword = obfPwd;
+		// 敏感数据用完立刻清零
+		pwdBytes.fill(0);
+	}
+
+	/**
+	 * 获取密码时即时还原
+	 */
+	private getPassword(): string | null {
+		const memKey = this.memoryKey;
+		const obfPwd = this.obfuscatedPassword;
+		
+		if (!memKey || !obfPwd) return null;
+		
+		const pwdBytes = new Uint8Array(obfPwd.length);
+		for (let i = 0; i < obfPwd.length; i++) {
+			pwdBytes[i] = obfPwd[i]! ^ memKey[i]!;
+		}
+		const pwd = new TextDecoder().decode(pwdBytes);
+		pwdBytes.fill(0);
+		return pwd;
+	}
+
+	/**
+	 * 密钥缺失提示（针对未设置密码的情况）
+	 */
+	private notifyPasswordMissing() {
+		const now = Date.now();
+		const lastTime = this.errorThrottler.get("__PWD_MISSING") || 0;
+		if (now - lastTime > 5000) { // 5 秒只提醒一次
+			new Notice(i18n.t('NOTICE_SET_PASSWORD'));
+			this.errorThrottler.set("__PWD_MISSING", now);
+		}
+	}
+
+	/**
+	 * 解密失败提示（针对密码错误或损坏的情况）
+	 */
+	private notifyDecryptFailed(path: string) {
+		const fileName = path.split('/').pop() || path;
+		const now = Date.now();
+		const lastTime = this.errorThrottler.get("__DECRYPT_FAIL_" + path) || 0;
+		if (now - lastTime > 5000) {
+			new Notice(i18n.t('ERROR_DECRYPT', { name: fileName }));
+			this.errorThrottler.set("__DECRYPT_FAIL_" + path, now);
+		}
+	}
 
 	async onload() {
 		await this.loadSettings();
@@ -270,6 +353,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		this.blobUrlCache.clear();
 		this.decryptedSizeCache.clear();
 		this.crypto.clearCache();
+		this.setPassword(null); // 显式擦除混淆内存
 	}
 
 	/**
@@ -278,8 +362,9 @@ export default class PhantomCipherPlugin extends Plugin {
 	async fetchPassword() {
 		const storage = (this.app as any).secretStorage;
 		if (!storage) return;
-		this.rawPassword = typeof storage.get === 'function' ? await storage.get(this.settings.secretName) : storage.secrets?.[this.settings.secretName];
-		if (this.rawPassword) {
+		const raw = typeof storage.get === 'function' ? await storage.get(this.settings.secretName) : storage.secrets?.[this.settings.secretName];
+		if (raw) {
+			this.setPassword(raw); // 使用混淆存储
 			this.crypto.clearCache();
 			this.updateStatusBar(this.app.workspace.getActiveFile());
 		}
@@ -335,21 +420,6 @@ export default class PhantomCipherPlugin extends Plugin {
 		const self = this;
 		const adapter = this.app.vault.adapter;
 
-		// 统一处理解密异常
-		const handleCryptoError = (path: string) => {
-			const fileName = path.split('/').pop() || path;
-			const errorMsg = i18n.t('ERROR_DECRYPT', { name: fileName });
-			const now = Date.now();
-			const lastTime = self.errorThrottler.get(path) || 0;
-
-			if (now - lastTime > 3000) {
-				new Notice(errorMsg);
-				self.errorThrottler.set(path, now);
-			}
-			// 必须抛出异常，防止流程继续执行并返回加密乱码
-			throw new Error(errorMsg);
-		};
-
 		// 拦截资源路径。如果是加密媒体文件，返回解密后的 Blob URL。
 		adapter.getResourcePath = (path: string): string => {
 			if (self.blobUrlCache.has(path)) return self.blobUrlCache.get(path)!;
@@ -371,24 +441,52 @@ export default class PhantomCipherPlugin extends Plugin {
 		this.app.vault.cachedRead = async (file: TFile): Promise<string> => {
 			const content = await self.originalRead(file.path);
 			if (file.path.includes(".obsidian") || !self.crypto.isEncrypted(content) || self.isSyncCaller()) return content;
-			if (!self.rawPassword) await self.fetchPassword();
-			const decrypted = await self.crypto.decrypt(content, self.rawPassword || "");
-			if (decrypted) return new TextDecoder().decode(decrypted);
-			return handleCryptoError(file.path);
+
+			if (!self.getPassword()) await self.fetchPassword();
+			const pwd = self.getPassword();
+			
+			if (!pwd) {
+				self.decryptedPaths.delete(file.path); // 未解密
+				self.notifyPasswordMissing(); // 提示设置密码
+				return content; // 返回密文原始内容
+			}
+			
+			const decrypted = await self.crypto.decrypt(content, pwd);
+			if (decrypted) {
+				self.decryptedPaths.add(file.path); // 解密成功
+				return new TextDecoder().decode(decrypted);
+			}
+			
+			self.decryptedPaths.delete(file.path); // 解密失败
+			self.notifyDecryptFailed(file.path);
+			return content; 
 		};
 
 		// 处理文本读取：如果是加密文件则自动解密
 		adapter.read = async (path: string): Promise<string> => {
 			const content = await self.originalRead(path);
 			if (path.includes(".obsidian") || !self.crypto.isEncrypted(content) || self.isSyncCaller()) return content;
-			if (!self.rawPassword) await self.fetchPassword();
-			const decrypted = await self.crypto.decrypt(content, self.rawPassword || "");
+			
+			if (!self.getPassword()) await self.fetchPassword();
+			const pwd = self.getPassword();
+			
+			if (!pwd) {
+				self.decryptedPaths.delete(path);
+				self.notifyPasswordMissing();
+				return content;
+			}
+			
+			const decrypted = await self.crypto.decrypt(content, pwd);
 			if (decrypted) {
+				self.decryptedPaths.add(path);
 				const text = new TextDecoder().decode(decrypted);
 				self.decryptedSizeCache.set(path, text.length); // 记录文本长度
 				return text;
 			}
-			return handleCryptoError(path);
+			
+			self.decryptedPaths.delete(path);
+			self.notifyDecryptFailed(path);
+			return content;
 		};
 
 		// 处理二进制读取：支持附件透明解密
@@ -396,10 +494,19 @@ export default class PhantomCipherPlugin extends Plugin {
 			const data = await self.originalReadBinary(path);
 			if (path.includes(".obsidian") || !self.crypto.isEncrypted(data.slice(0, MAGIC_HEADER.length)) || self.isSyncCaller()) return data;
 
-			if (!self.rawPassword) await self.fetchPassword();
+			if (!self.getPassword()) await self.fetchPassword();
+			const pwd = self.getPassword();
+
+			if (!pwd) {
+				self.decryptedPaths.delete(path);
+				self.notifyPasswordMissing();
+				return data;
+			}
+
 			const armoredText = new TextDecoder().decode(data);
-			const decrypted = await self.crypto.decrypt(armoredText, self.rawPassword || "");
+			const decrypted = await self.crypto.decrypt(armoredText, pwd);
 			if (decrypted) {
+				self.decryptedPaths.add(path);
 				self.decryptedSizeCache.set(path, decrypted.byteLength);
 				// 针对媒体文件生成 Blob URL，让 app:// 协议能显示加密图片
 				const ext = path.split('.').pop()?.toLowerCase() || '';
@@ -411,7 +518,10 @@ export default class PhantomCipherPlugin extends Plugin {
 				}
 				return self.crypto["toBuffer"](decrypted);
 			}
-			return handleCryptoError(path) as any;
+			
+			self.decryptedPaths.delete(path);
+			self.notifyDecryptFailed(path);
+			return data;
 		};
 
 		/**
@@ -419,7 +529,8 @@ export default class PhantomCipherPlugin extends Plugin {
 		 */
 		const handleWrite = async (path: string, data: Uint8Array): Promise<string | Uint8Array | null> => {
             if (path.includes(".obsidian") || self.isSyncCaller()) return data; // 同步插件写入时直接透传密文，不触发二次加密
-            if (!self.rawPassword) await self.fetchPassword();
+            if (!self.getPassword()) await self.fetchPassword();
+			const pwd = self.getPassword();
 
 			// 仅读取前 10 字节判断文件是否原本直接就是加密状态
 			let isCurrentlyEncrypted = false;
@@ -428,27 +539,43 @@ export default class PhantomCipherPlugin extends Plugin {
 				isCurrentlyEncrypted = self.crypto.isEncrypted(head);
 			} catch (e) {}
 
+			// 如果磁盘上的文件是加密的，但内存集合中没有该路径（说明未成功解密过）
+			// 此时绝对禁止任何写入。哪怕用户删掉了编辑器里的加密头，也知道它是加密文件。
+			if (isCurrentlyEncrypted && !self.decryptedPaths.has(path)) {
+				return null; // 静默拦截物理写入
+			}
+
+			if (self.crypto.isEncrypted(data)) {
+				return data;
+			}
+
+			// 模式判定逻辑
+			if (self.crypto.isEncrypted(data)) return data;
+
 			const ext = path.split('.').pop()?.toLowerCase() || '';
 			const shouldCompress = !NON_COMPRESSIBLE.has(ext);
 
-			// 模式判定逻辑
+			// 执行加密写入
 			// 如果是非强制模式，根据头部的探测结果决定是否加密
-			if ((self.settings.mode === 'encrypt' || isCurrentlyEncrypted) && self.settings.mode !== 'decrypt' && self.rawPassword) {
-				const encrypted = await self.crypto.encrypt(data, self.rawPassword, shouldCompress);
-				self.decryptedSizeCache.set(path, data.byteLength); // 更新长度缓存
+			if ((self.settings.mode === 'encrypt' || isCurrentlyEncrypted) && self.settings.mode !== 'decrypt' && pwd) {
+				const encrypted = await self.crypto.encrypt(data, pwd, shouldCompress);
+				self.decryptedSizeCache.set(path, data.byteLength);
 				return encrypted;
 			}
+			
 			self.decryptedSizeCache.set(path, data.byteLength);
 			return data;
 		};
 
 		adapter.write = async (path, data, options) => {
 			const result = await handleWrite(path, new TextEncoder().encode(data));
+			if (result === null) return;
 			return typeof result === 'string' ? await self.originalWrite(path, result, options) : await self.originalWrite(path, data, options);
 		};
 
 		adapter.writeBinary = async (path, data, options) => {
 			const result = await handleWrite(path, new Uint8Array(data));
+			if (result === null) return;
 			return typeof result === 'string' ? await self.originalWrite(path, result, options) : await self.originalWriteBinary(path, data, options);
 		};
 
@@ -468,7 +595,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		if (this.blobUrlCache.has(path)) return true;
 		try {
 			const rawHead = await this.originalReadBinary(path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
-			if (this.crypto.isEncrypted(rawHead) && this.rawPassword) {
+			if (this.crypto.isEncrypted(rawHead) && this.getPassword()) {
 				// 调用 readBinary 触发 Hook，生成并记录 Blob URL
 				await this.app.vault.readBinary(file);
 				return true;
@@ -520,14 +647,22 @@ export default class PhantomCipherPlugin extends Plugin {
 			// 1. 物理状态检查（仅用于状态标展示）
 			const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
 			const isEnc = this.crypto.isEncrypted(rawHead);
+			// 物理上是加密文件，且必须在“成功解密列表”中，才算“透明”
+			const isTransparent = this.decryptedPaths.has(file.path);
 			
 			this.statusBarItem.empty();
 			if (isEnc) {
 				this.statusBarItem.style.display = "inline-block";
 				const span = this.statusBarItem.createSpan();
 				setIcon(span, "lock");
-				span.createSpan({ text: this.rawPassword ? i18n.t('STATUS_TRANSPARENT') : i18n.t('STATUS_LOCKED') });
-				this.statusBarItem.style.color = this.rawPassword ? "var(--text-success)" : "var(--text-error)";
+				
+				// 移动端仅显示图标，非移动端根据解密实况显示文字
+				if (!Platform.isMobile) {
+					span.createSpan({ text: isTransparent ? i18n.t('STATUS_TRANSPARENT') : i18n.t('STATUS_LOCKED') });
+				}
+				
+				// 颜色反馈：解密成功绿色，未成功（只读）红色
+				this.statusBarItem.style.color = isTransparent ? "var(--text-success)" : "var(--text-error)";
 			} else {
 				this.statusBarItem.style.display = "none";
 			}
@@ -564,28 +699,86 @@ export default class PhantomCipherPlugin extends Plugin {
 	}
 
 	/**
+	 * 安全转换机制
+	 * 逻辑：写入副本 -> 校验副本 -> 替换原件
+	 */
+	private async safeConvertProcess(path: string, extension: string, action: 'encrypt' | 'decrypt', pwd: string): Promise<boolean> {
+		const tempPath = path + ".phantom_tmp";
+		try {
+			let targetData: Uint8Array | string;
+			let originalDataLength = 0;
+
+			// 1. 内存转换
+			if (action === 'encrypt') {
+				const data = new Uint8Array(await this.originalReadBinary(path));
+				originalDataLength = data.byteLength;
+				targetData = await this.crypto.encrypt(data, pwd, !NON_COMPRESSIBLE.has(extension));
+			} else {
+				const rawText = await this.originalRead(path);
+				const decrypted = await this.crypto.decrypt(rawText, pwd);
+				if (!decrypted) throw new Error(i18n.t('ERR_MEM_DECRYPT'));
+				targetData = decrypted;
+				originalDataLength = decrypted.byteLength;
+			}
+
+			// 2. 写入副本
+			if (typeof targetData === 'string') {
+				await this.originalWrite(tempPath, targetData);
+			} else {
+				await this.originalWriteBinary(tempPath, targetData);
+			}
+
+			// 3. 副本校验
+			const tempRead = await this.originalReadBinary(tempPath);
+			if (action === 'encrypt') {
+				const tempArmored = new TextDecoder().decode(tempRead);
+				const testPlain = await this.crypto.decrypt(tempArmored, pwd);
+				if (!testPlain || testPlain.byteLength !== originalDataLength) {
+					throw new Error(i18n.t('ERR_VAL_ENC_CORRUPT'));
+				}
+			} else {
+				if (tempRead.byteLength !== (targetData as Uint8Array).byteLength) {
+					throw new Error(i18n.t('ERR_VAL_DEC_MISMATCH'));
+				}
+			}
+
+			// 4. 原子替换：删除原件并重命名副本
+			// 在某些情况 rename 可能会失败，先 remove 再 rename
+			await this.app.vault.adapter.remove(path);
+			await this.app.vault.adapter.rename(tempPath, path);
+			
+			return true;
+
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			// 失败时尝试清理副本，如果清理失败说明是系统问题，保留副本给用户手动抢救
+			console.error(i18n.t('LOG_ERR_CONVERSION', { path }), message);
+			try { await this.app.vault.adapter.remove(tempPath); } catch (ce) {}
+			return false;
+		}
+	}
+
+	/**
 	 * 手动切换单文件的加解密物理状态
 	 */
 	private async manuallyToggleFile(file: TFile) {
-		if (!this.rawPassword) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
-		const raw = await this.originalRead(file.path);
-		const isEnc = this.crypto.isEncrypted(raw);
-		const data = new Uint8Array(await this.originalReadBinary(file.path));
+		const pwd = this.getPassword();
+		if (!pwd) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
+		
+		const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+		const isEnc = this.crypto.isEncrypted(rawHead);
 
-		try {
-			if (isEnc) {
-				const plain = await this.app.vault.readBinary(file);
-				await this.originalWriteBinary(file.path, plain);
-				new Notice(i18n.t('NOTICE_RESTORED', { name: file.name }));
-			} else {
-				const ext = file.extension.toLowerCase();
-				const armored = await this.crypto.encrypt(data, this.rawPassword, !NON_COMPRESSIBLE.has(ext));
-				await this.originalWrite(file.path, armored);
-				new Notice(i18n.t('NOTICE_ENCRYPTED', { name: file.name }));
-			}
-		} catch (e) {
+		const action = isEnc ? 'decrypt' : 'encrypt';
+		
+		// 接入带有校验恢复机制的安全转换流
+		const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action, pwd);
+		
+		if (success) {
+			new Notice(isEnc ? i18n.t('NOTICE_RESTORED', { name: file.name }) : i18n.t('NOTICE_ENCRYPTED', { name: file.name }));
+		} else {
 			new Notice(i18n.t('NOTICE_FAILED', { name: file.name }));
 		}
+		
 		await this.updateStatusBar(file);
 	}
 
@@ -594,7 +787,8 @@ export default class PhantomCipherPlugin extends Plugin {
 	 * 采用底层安全旁路执行，通过读取/写入底层原生的 adapter API 绕开 Hook，防止死循环。
 	 */
 	private async batchProcessFolder(folder: TFolder, action: 'encrypt' | 'decrypt') {
-		if (!this.rawPassword) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
+		const pwd = this.getPassword();
+		if (!pwd) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
 		
 		// 递归获取所有属于此文件夹的文件
 		const allFiles = this.app.vault.getFiles();
@@ -615,23 +809,10 @@ export default class PhantomCipherPlugin extends Plugin {
 					const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
 					const isEnc = this.crypto.isEncrypted(rawHead);
 
-					if (isEncryptAction && !isEnc) {
-						// 批量加密操作：目标未加密，执行加密
-						const data = new Uint8Array(await this.originalReadBinary(file.path));
-						const ext = file.extension.toLowerCase();
-						const armored = await this.crypto.encrypt(data, this.rawPassword, !NON_COMPRESSIBLE.has(ext));
-						// 使用底层原始 Write，不触发 Hook 从而避免死锁
-						await this.originalWrite(file.path, armored);
-						successCount++;
-					} else if (!isEncryptAction && isEnc) {
-						// 批量解密操作：目标已加密，执行解密
-						const rawText = await this.originalRead(file.path);
-						const decrypted = await this.crypto.decrypt(rawText, this.rawPassword);
-						if (decrypted) {
-							// 使用底层原始 WriteBinary 还原明文
-							await this.originalWriteBinary(file.path, decrypted);
-							successCount++;
-						}
+					if ((isEncryptAction && !isEnc) || (!isEncryptAction && isEnc)) {
+						// 接入带有校验恢复机制的安全转换流
+						const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action, pwd);
+						if (success) successCount++;
 					}
 				} catch (e) {
 					const actionName = isEncryptAction ? i18n.t('MODE_ENCRYPT') : i18n.t('MODE_DECRYPT');
