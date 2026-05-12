@@ -5,8 +5,6 @@ export default {
     MODE_NONE: "Read-only",
     MODE_ENCRYPT: "Auto-encrypt",
     MODE_DECRYPT: "Auto-decrypt",
-    SECRET_NAME: "Secret Identifier",
-    SECRET_NAME_DESC: "The key name used to store the password in the system keychain.",
     MASTER_KEY: "Set Master Key",
     MASTER_KEY_DESC: "Select the encryption master key from the system keychain.",
     RIBBON_TEXT: "Encrypt/Restore Toggle",

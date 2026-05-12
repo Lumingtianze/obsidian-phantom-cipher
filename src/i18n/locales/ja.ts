@@ -5,8 +5,6 @@ export default {
     MODE_NONE: "読み取り専用",
     MODE_ENCRYPT: "自動暗号化",
     MODE_DECRYPT: "自動復元",
-    SECRET_NAME: "パスワード識別子",
-    SECRET_NAME_DESC: "システムキーチェーンに保存されるパスワードのキー名。",
     MASTER_KEY: "マスターパスワード設定",
     MASTER_KEY_DESC: "システムキーチェーンから暗号化用マスターパスワードを選択します。",
     RIBBON_TEXT: "暗号化/復元の切り替え",

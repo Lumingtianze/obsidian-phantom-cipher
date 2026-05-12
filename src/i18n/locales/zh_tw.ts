@@ -5,8 +5,6 @@ export default {
     MODE_NONE: "僅讀取",
     MODE_ENCRYPT: "自動加密",
     MODE_DECRYPT: "自動還原",
-    SECRET_NAME: "密碼標識符",
-    SECRET_NAME_DESC: "系統鑰匙串中存儲密碼的 Key 名稱。",
     MASTER_KEY: "設置主密碼",
     MASTER_KEY_DESC: "從系統鑰匙串中選擇加密主密碼",
     RIBBON_TEXT: "加密/還原轉換",

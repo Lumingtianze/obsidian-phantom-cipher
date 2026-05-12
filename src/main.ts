@@ -19,7 +19,7 @@ interface PhantomCipherSettings {
 
 const DEFAULT_SETTINGS: PhantomCipherSettings = {
 	mode: 'none',
-	secretName: 'vault-master-key'
+	secretName: ''
 };
 
 const MAGIC_HEADER = "ENC_V1:";
@@ -380,7 +380,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		// 已知同步类插件的 ID 或核心关键词
 		const syncBlacklist =[
 			"remotely-save", 
-			"livesync", 
+			"obsidian-livesync", 
 		];
 
 		// 1. 直接关键词匹配（通用）
@@ -431,9 +431,22 @@ export default class PhantomCipherPlugin extends Plugin {
 		adapter.stat = async (path: string): Promise<Stat | null> => {
 			const stat = await self.originalStat(path);
 			if (!stat || path.includes(".obsidian") || self.isSyncCaller()) return stat;
+            
+            // 如果内存缓存中有，直接返回解密后的尺寸
 			if (self.decryptedSizeCache.has(path)) {
 				stat.size = self.decryptedSizeCache.get(path)!;
-			}
+			} else {
+                // 如果缓存不存在，主动探测文件头部
+                try {
+                    const head = await self.originalReadBinary(path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+                    if (self.crypto.isEncrypted(head)) {
+                        await adapter.readBinary(path);
+                        if (self.decryptedSizeCache.has(path)) {
+                            stat.size = self.decryptedSizeCache.get(path)!;
+                        }
+                    }
+                } catch (e) {}
+            }
 			return stat;
 		};
 
@@ -528,7 +541,11 @@ export default class PhantomCipherPlugin extends Plugin {
 		 * 写入逻辑处理器：根据插件模式决定是否加密落地数据
 		 */
 		const handleWrite = async (path: string, data: Uint8Array): Promise<string | Uint8Array | null> => {
-            if (path.includes(".obsidian") || self.isSyncCaller()) return data; // 同步插件写入时直接透传密文，不触发二次加密
+            if (path.includes(".obsidian") || self.isSyncCaller()) {
+                self.decryptedPaths.delete(path);
+                self.decryptedSizeCache.delete(path);
+                return data; 
+            } // 同步插件写入时直接透传密文，不触发二次加密
             if (!self.getPassword()) await self.fetchPassword();
 			const pwd = self.getPassword();
 
@@ -849,16 +866,6 @@ class CryptoSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.mode)
 				.onChange(async v => {
 					this.plugin.settings.mode = v as any;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName(i18n.t('SECRET_NAME'))
-			.setDesc(i18n.t('SECRET_NAME_DESC'))
-			.addText(t => t
-				.setValue(this.plugin.settings.secretName)
-				.onChange(async v => {
-					this.plugin.settings.secretName = v;
 					await this.plugin.saveSettings();
 				}));
 
