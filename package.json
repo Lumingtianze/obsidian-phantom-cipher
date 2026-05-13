@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-phantom-cipher",
-	"version": "1.0.2",
+	"version": "1.0.3",
 	"description": "Transparent vault encryption for Obsidian using Argon2id and AES-GCM.",
 	"main": "main.js",
 	"type": "module",

@@ -25,6 +25,10 @@ PhantomCipher は、Obsidian 向けにシームレスな透明暗号化体験を
 3. **動作モード** を「自動暗号化」に変更します。
 4. **リボンアイコン** または **右クリックメニュー** から、特定のファイルやフォルダの暗号化状態を手動で切り替えます。
 
+## 🛠️ 復元ツール
+Obsidian 以外でファイルを復号する必要がある場合（プラグインが利用できない、またはデータをエクスポートしたい場合など）、PhantomCipher CLI 復号ツールをご利用ください：
+[PhantomCipher CLI 復号ツール](https://github.com/Lumingtianze/phantom-decrypt)
+
 ## ライセンス
 
 本プロジェクトは [Mozilla Public License 2.0 (MPL-2.0)](./LICENSE) の下でライセンスされています。

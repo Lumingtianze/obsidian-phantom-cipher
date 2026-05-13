@@ -25,6 +25,10 @@ PhantomCipher provides a seamless transparent encryption experience for your Obs
 3. Change **Operation mode** to "Auto-encrypt".
 4. Use the **Ribbon icon** or **Right-click menu** to manually toggle encryption for specific files or folders.
 
+## 🛠️ Recovery
+If you need to decrypt files outside of Obsidian (for example, if the plugin is unavailable or you need to export data), please use the PhantomCipher CLI decryption tool:
+[PhantomCipher CLI Decryptor](https://github.com/Lumingtianze/phantom-decrypt)
+
 ## License
 
 This project is licensed under the [Mozilla Public License 2.0 (MPL-2.0)](./LICENSE).

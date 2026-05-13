@@ -20,11 +20,13 @@ interface ISecretStorage {
 interface PhantomCipherSettings {
 	mode: 'encrypt' | 'none';
 	secretName: string;
+	encryptMedia: boolean;
 }
 
 const DEFAULT_SETTINGS: PhantomCipherSettings = {
 	mode: 'none',
-	secretName: ''
+	secretName: '',
+	encryptMedia: false
 };
 
 const MAGIC_HEADER = "ENC_V1:";
@@ -63,7 +65,7 @@ class CryptoHelper {
 		if (buf instanceof ArrayBuffer) {
 			return buf.slice(arr.byteOffset, arr.byteOffset + arr.byteLength);
 		}
-		
+
 		const fixed = new ArrayBuffer(arr.byteLength);
 		new Uint8Array(fixed).set(arr);
 		return fixed;
@@ -103,7 +105,7 @@ class CryptoHelper {
 			const result = await argon2id({
 				password, salt: saltArr, iterations: 3, memorySize: 65536, parallelism: 4, hashLength: 32, outputType: 'binary'
 			});
-			const derivedKey = await crypto.subtle.importKey("raw", this.toBuffer(result), { name: "AES-GCM" }, false,["encrypt", "decrypt"]);
+			const derivedKey = await crypto.subtle.importKey("raw", this.toBuffer(result), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 			this.keyMapCache.set(cacheKey, derivedKey);
 			return derivedKey;
 		})();
@@ -163,8 +165,8 @@ class CryptoHelper {
 			let finalData: Uint8Array = new Uint8Array(decrypted);
 			if (compressionFlag === 1) finalData = await this.decompress(finalData);
 			return finalData;
-		} catch { 
-			return null; 
+		} catch {
+			return null;
 		}
 	}
 
@@ -174,7 +176,7 @@ class CryptoHelper {
 	isEncrypted(data: string | ArrayBuffer | Uint8Array | null): boolean {
 		if (!data) return false;
 		if (typeof data === 'string') return data.startsWith(MAGIC_HEADER);
-		
+
 		let bytes: Uint8Array;
 		if (data instanceof Uint8Array) {
 			bytes = data;
@@ -198,7 +200,7 @@ class CryptoHelper {
 export default class PhantomCipherPlugin extends Plugin {
 	settings!: PhantomCipherSettings;
 	crypto: CryptoHelper = new CryptoHelper();
-	
+
 	// 内存混淆安全凭证
 	private memoryKey: Uint8Array | null = null;
 	private obfuscatedPassword: Uint8Array | null = null;
@@ -237,11 +239,11 @@ export default class PhantomCipherPlugin extends Plugin {
 		const pwdBytes = new TextEncoder().encode(pwd);
 		const memKey = crypto.getRandomValues(new Uint8Array(pwdBytes.length));
 		const obfPwd = new Uint8Array(pwdBytes.length);
-		
+
 		for (let i = 0; i < pwdBytes.length; i++) {
 			obfPwd[i] = pwdBytes[i]! ^ memKey[i]!;
 		}
-		
+
 		this.memoryKey = memKey;
 		this.obfuscatedPassword = obfPwd;
 		// 敏感数据用完立刻清零
@@ -254,9 +256,9 @@ export default class PhantomCipherPlugin extends Plugin {
 	private getPassword(): string | null {
 		const memKey = this.memoryKey;
 		const obfPwd = this.obfuscatedPassword;
-		
+
 		if (!memKey || !obfPwd) return null;
-		
+
 		const pwdBytes = new Uint8Array(obfPwd.length);
 		for (let i = 0; i < obfPwd.length; i++) {
 			pwdBytes[i] = obfPwd[i]! ^ memKey[i]!;
@@ -339,9 +341,9 @@ export default class PhantomCipherPlugin extends Plugin {
 		this.registerEvent(this.app.vault.on('modify', (file) => {
 			if (file instanceof TFile && file === this.app.workspace.getActiveFile()) void this.updateStatusBar(file);
 		}));
-        this.registerEvent(this.app.metadataCache.on('changed', (file) => {
-            if (file === this.app.workspace.getActiveFile()) void this.updateStatusBar(file);
-        }));
+		this.registerEvent(this.app.metadataCache.on('changed', (file) => {
+			if (file === this.app.workspace.getActiveFile()) void this.updateStatusBar(file);
+		}));
 
 		this.app.workspace.onLayoutReady(() => {
 			void this.fetchPassword().then(() => {
@@ -394,9 +396,9 @@ export default class PhantomCipherPlugin extends Plugin {
 		const lowStack = stack.toLowerCase();
 
 		// 已知同步类插件的 ID 或核心关键词
-		const syncBlacklist =[
-			"remotely-save", 
-			"obsidian-livesync", 
+		const syncBlacklist = [
+			"remotely-save",
+			"obsidian-livesync",
 		];
 
 		// 1. 直接关键词匹配（通用）
@@ -447,29 +449,29 @@ export default class PhantomCipherPlugin extends Plugin {
 		adapter.stat = async (path: string): Promise<Stat | null> => {
 			const stat = await this.originalStat(path);
 			if (!stat || path.startsWith(configDir) || this.isSyncCaller()) return stat;
-            
-            // 如果内存缓存中有，直接返回解密后的尺寸
+
+			// 如果内存缓存中有，直接返回解密后的尺寸
 			if (this.decryptedSizeCache.has(path)) {
 				stat.size = this.decryptedSizeCache.get(path)!;
 				return stat;
-			} 
+			}
 
-            if (this.decryptedPaths.has(path)) {
-                try {
-                    // 仅对已知解密成功的文件进行一次读取以更新缓存
-                    const data = await this.originalReadBinary(path);
-                    const armoredText = new TextDecoder().decode(data);
-                    const decrypted = await this.crypto.decrypt(armoredText, this.getPassword() || "");
-                    if (decrypted) {
-                        const size = decrypted.byteLength;
-                        this.decryptedSizeCache.set(path, size);
-                        stat.size = size;
-                    }
-                } catch {
-                    // 忽略探测错误，返回原始 stat
-                }
-            }
-            
+			if (this.decryptedPaths.has(path)) {
+				try {
+					// 仅对已知解密成功的文件进行一次读取以更新缓存
+					const data = await this.originalReadBinary(path);
+					const armoredText = new TextDecoder().decode(data);
+					const decrypted = await this.crypto.decrypt(armoredText, this.getPassword() || "");
+					if (decrypted) {
+						const size = decrypted.byteLength;
+						this.decryptedSizeCache.set(path, size);
+						stat.size = size;
+					}
+				} catch {
+					// 忽略探测错误，返回原始 stat
+				}
+			}
+
 			return stat;
 		};
 
@@ -480,38 +482,38 @@ export default class PhantomCipherPlugin extends Plugin {
 
 			if (!this.getPassword()) await this.fetchPassword();
 			const pwd = this.getPassword();
-			
+
 			if (!pwd) {
 				this.decryptedPaths.delete(file.path); // 未解密
 				this.notifyPasswordMissing(); // 提示设置密码
 				return content; // 返回密文原始内容
 			}
-			
+
 			const decrypted = await this.crypto.decrypt(content, pwd);
 			if (decrypted) {
 				this.decryptedPaths.add(file.path); // 解密成功
 				return new TextDecoder().decode(decrypted);
 			}
-			
+
 			this.decryptedPaths.delete(file.path); // 解密失败
 			this.notifyDecryptFailed(file.path);
-			return content; 
+			return content;
 		};
 
 		// 处理文本读取：如果是加密文件则自动解密
 		adapter.read = async (path: string): Promise<string> => {
 			const content = await this.originalRead(path);
 			if (path.startsWith(configDir) || !this.crypto.isEncrypted(content) || this.isSyncCaller()) return content;
-			
+
 			if (!this.getPassword()) await this.fetchPassword();
 			const pwd = this.getPassword();
-			
+
 			if (!pwd) {
 				this.decryptedPaths.delete(path);
 				this.notifyPasswordMissing();
 				return content;
 			}
-			
+
 			const decrypted = await this.crypto.decrypt(content, pwd);
 			if (decrypted) {
 				this.decryptedPaths.add(path);
@@ -519,7 +521,7 @@ export default class PhantomCipherPlugin extends Plugin {
 				this.decryptedSizeCache.set(path, text.length); // 记录文本长度
 				return text;
 			}
-			
+
 			this.decryptedPaths.delete(path);
 			this.notifyDecryptFailed(path);
 			return content;
@@ -553,7 +555,7 @@ export default class PhantomCipherPlugin extends Plugin {
 				}
 				return this.crypto.toBuffer(decrypted);
 			}
-			
+
 			this.decryptedPaths.delete(path);
 			this.notifyDecryptFailed(path);
 			return data;
@@ -563,13 +565,14 @@ export default class PhantomCipherPlugin extends Plugin {
 		 * 写入逻辑处理器：根据插件模式决定是否加密落地数据
 		 */
 		const handleWrite = async (path: string, data: Uint8Array): Promise<string | Uint8Array | null> => {
-            if (path.startsWith(configDir) || this.isSyncCaller()) {
-                this.decryptedPaths.delete(path);
-                this.decryptedSizeCache.delete(path);
-                return data; 
-            } // 同步插件写入时直接透传密文，不触发二次加密
-            if (!this.getPassword()) await this.fetchPassword();
+			if (path.startsWith(configDir) || this.isSyncCaller()) {
+				this.decryptedPaths.delete(path);
+				this.decryptedSizeCache.delete(path);
+				return data;
+			} // 同步插件写入时直接透传密文，不触发二次加密
+			if (!this.getPassword()) await this.fetchPassword();
 			const pwd = this.getPassword();
+			const ext = path.split('.').pop()?.toLowerCase() || '';
 
 			// 仅读取前 10 字节判断文件是否原本直接就是加密状态
 			let isCurrentlyEncrypted = false;
@@ -586,22 +589,28 @@ export default class PhantomCipherPlugin extends Plugin {
 				return null; // 静默拦截物理写入
 			}
 
+			// 如果文件已经加密直接返回
 			if (this.crypto.isEncrypted(data)) {
 				return data;
 			}
 
-			// 模式判定逻辑
-			if (this.crypto.isEncrypted(data)) return data;
+			const isMedia = PREVIEW_SUPPORTED.has(ext);
 
-			const ext = path.split('.').pop()?.toLowerCase() || '';
-			const shouldCompress = !NON_COMPRESSIBLE.has(ext);
+			// 只有当满足以下任一条件时，才执行加密写入：
+			// - 该文件当前在磁盘上已经是加密状态（必须维持一致性，防止因开关关闭导致自动解密）
+			// - 处于自动加密模式，且（不是媒体文件 或 开启了媒体加密开关）
+			const shouldEncrypt = pwd && (
+				isCurrentlyEncrypted ||
+				(this.settings.mode === 'encrypt' && (!isMedia || this.settings.encryptMedia))
+			);
 
-			// 仅在明确开启加密模式，或该文件原本就是加密状态时，才执行加密写入
-			if ((this.settings.mode === 'encrypt' || isCurrentlyEncrypted) && pwd) {
-				const encrypted = await this.crypto.encrypt(data, pwd, shouldCompress);
+			if (shouldEncrypt && pwd) {
+				const encrypted = await this.crypto.encrypt(data, pwd, !NON_COMPRESSIBLE.has(ext));
 				this.decryptedSizeCache.set(path, data.byteLength);
 				return encrypted;
 			}
+
+			// 不满足加密条件，执行明文写入
 			this.decryptedSizeCache.set(path, data.byteLength);
 			return data;
 		};
@@ -674,7 +683,7 @@ export default class PhantomCipherPlugin extends Plugin {
 
 				// Obsidian 会追加 ? 参数缓存修饰，只对比基础路径
 				const srcBase = src.split('?')[0];
-				
+
 				// 匹配上了残留的本地物理路径，说明浏览器之前请求失败了，直接通过 DOM 更新替换为 Blob
 				if (srcBase && (srcBase === originalUrlBase || srcBase.endsWith(path) || srcBase.endsWith(encodedPath))) {
 					el.setAttribute('src', blobUrl);
@@ -690,9 +699,9 @@ export default class PhantomCipherPlugin extends Plugin {
 	 * 更新状态栏 UI 展示文件的加密状态
 	 */
 	private async updateStatusBar(file: TFile | null) {
-		if (!file) { 
+		if (!file) {
 			this.statusBarItem.hide();
-			return; 
+			return;
 		}
 		try {
 			// 1. 物理状态检查（仅用于状态标展示）
@@ -700,18 +709,18 @@ export default class PhantomCipherPlugin extends Plugin {
 			const isEnc = this.crypto.isEncrypted(rawHead);
 			// 物理上是加密文件，且必须在“成功解密列表”中，才算“透明”
 			const isTransparent = this.decryptedPaths.has(file.path);
-			
+
 			this.statusBarItem.empty();
 			if (isEnc) {
 				this.statusBarItem.show();
-				
+
 				// 解密成功绿色，未成功（只读）红色
 				this.statusBarItem.toggleClass("is-transparent", isTransparent);
 				this.statusBarItem.toggleClass("is-locked", !isTransparent);
 
 				const span = this.statusBarItem.createSpan();
 				setIcon(span, "lock");
-				
+
 				// 移动端仅显示图标，非移动端根据解密实况显示文字
 				if (!Platform.isMobile) {
 					span.createSpan({ text: isTransparent ? i18n.t('STATUS_TRANSPARENT') : i18n.t('STATUS_LOCKED') });
@@ -721,8 +730,8 @@ export default class PhantomCipherPlugin extends Plugin {
 			}
 
 			// 2. 预热任务队列：不论笔记本身是否加密，都要预热其中的媒体
-			const warmupTasks: Promise<boolean>[] =[];
-			
+			const warmupTasks: Promise<boolean>[] = [];
+
 			// 如果当前文件本身就是可预览的媒体（如直接打开图片/PDF），先预热它
 			if (PREVIEW_SUPPORTED.has(file.extension.toLowerCase())) {
 				warmupTasks.push(this.warmupFile(file));
@@ -748,8 +757,8 @@ export default class PhantomCipherPlugin extends Plugin {
 				}
 			}
 
-		} catch { 
-			this.statusBarItem.hide(); 
+		} catch {
+			this.statusBarItem.hide();
 		}
 	}
 
@@ -804,16 +813,21 @@ export default class PhantomCipherPlugin extends Plugin {
 			} catch {
 				/* 文件如果被强行抢占或不存在，忽略错误，让下面继续执行覆盖尝试 */
 			}
-            
-            // 获取临时文件的抽象引用并重命名
-            const tempAbstractFile = this.app.vault.getAbstractFileByPath(tempPath);
-            if (tempAbstractFile) {
-                await this.app.vault.rename(tempAbstractFile, path);
-            } else {
-                // 如果 Vault API 没能即时识别临时文件，回退到 Adapter API 重命名
-                await this.app.vault.adapter.rename(tempPath, path);
+
+			// 获取临时文件的抽象引用并重命名
+			const tempAbstractFile = this.app.vault.getAbstractFileByPath(tempPath);
+			if (tempAbstractFile) {
+				await this.app.vault.rename(tempAbstractFile, path);
+			} else {
+				// 如果 Vault API 没能即时识别临时文件，回退到 Adapter API 重命名
+				await this.app.vault.adapter.rename(tempPath, path);
+			}
+
+			// 转换成功后，强制 Obsidian 重新读取并建立索引
+            const file = this.app.vault.getAbstractFileByPath(path);
+            if (file instanceof TFile) {
+                this.app.metadataCache.trigger("changed", file);
             }
-			
 			return true;
 
 		} catch (e) {
@@ -831,21 +845,28 @@ export default class PhantomCipherPlugin extends Plugin {
 	private async manuallyToggleFile(file: TFile) {
 		const pwd = this.getPassword();
 		if (!pwd) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
-		
+
 		const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
 		const isEnc = this.crypto.isEncrypted(rawHead);
+		const ext = file.extension.toLowerCase();
+
+		// 如果是手动加密媒体文件但开关没开，进行提醒
+		if (!isEnc && PREVIEW_SUPPORTED.has(ext) && !this.settings.encryptMedia) {
+			new Notice(i18n.t('NOTICE_MEDIA_IGNORE'));
+			return;
+		}
 
 		const action = isEnc ? 'decrypt' : 'encrypt';
-		
+
 		// 接入带有校验恢复机制的安全转换流
 		const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action, pwd);
-		
+
 		if (success) {
 			new Notice(isEnc ? i18n.t('NOTICE_RESTORED', { name: file.name }) : i18n.t('NOTICE_ENCRYPTED', { name: file.name }));
 		} else {
 			new Notice(i18n.t('NOTICE_FAILED', { name: file.name }));
 		}
-		
+
 		await this.updateStatusBar(file);
 	}
 
@@ -856,57 +877,62 @@ export default class PhantomCipherPlugin extends Plugin {
 	private async batchProcessFolder(folder: TFolder, action: 'encrypt' | 'decrypt') {
 		const pwd = this.getPassword();
 		if (!pwd) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
-		
+
 		let successCount = 0;
 		const isEncryptAction = action === 'encrypt';
-        
-        // 递归遍历目标文件夹的 children 树
-        const targetFiles: TFile[] = [];
-        const recursiveCollect = (curr: TFolder) => {
-            for (const child of curr.children) {
-                if (child instanceof TFile) {
-                    // 只收集符合处理条件的文件类型
-                    if (child.extension === 'md' || PREVIEW_SUPPORTED.has(child.extension.toLowerCase()) || NON_COMPRESSIBLE.has(child.extension.toLowerCase())) {
-                        targetFiles.push(child);
-                    }
-                } else if (child instanceof TFolder) {
-                    recursiveCollect(child);
-                }
-            }
-        };
 
-        recursiveCollect(folder);
-		
-		new Notice(i18n.t('NOTICE_BATCH_START', { count: targetFiles.length }));
+		// 递归遍历目标文件夹的 children 树
+		const targetFiles: TFile[] = [];
+		const recursiveCollect = (curr: TFolder) => {
+			for (const child of curr.children) {
+				if (child instanceof TFile) {
+					const ext = child.extension.toLowerCase();
+					// 只收集符合处理条件的文件类型
+					if (ext === 'md' || (this.settings.encryptMedia && PREVIEW_SUPPORTED.has(ext))) {
+						targetFiles.push(child);
+					}
+				} else if (child instanceof TFolder) recursiveCollect(child);
+			}
+		};
 
-		for (const file of targetFiles) {
+		recursiveCollect(folder);
+
+		// 使用动态 Notice 显示进度
+		const progressNotice = new Notice(i18n.t('NOTICE_BATCH_START', { count: targetFiles.length }), 0);
+
+		for (let i = 0; i < targetFiles.length; i++) {
+            const file = targetFiles[i]!;
+            // 更新进度条文字
+            progressNotice.setMessage(`🚀 ${i18n.t(isEncryptAction ? 'MODE_ENCRYPT' : 'MODE_DECRYPT')}... (${i + 1}/${targetFiles.length})`);
+            
             try {
-                // 直接通过底层 Adapter 探查头信息判断状态
-                const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
-                const isEnc = this.crypto.isEncrypted(rawHead);
+				// 直接通过底层 Adapter 探查头信息判断状态
+				const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+				const isEnc = this.crypto.isEncrypted(rawHead);
 
-                if ((isEncryptAction && !isEnc) || (!isEncryptAction && isEnc)) {
-                    // 接入带有校验恢复机制的安全转换流
-                    const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action, pwd);
-                    if (success) successCount++;
-                }
-            } catch (e) {
-                const actionName = isEncryptAction ? i18n.t('MODE_ENCRYPT') : i18n.t('MODE_DECRYPT');
-                console.error(i18n.t('LOG_BATCH_ERROR', { action: actionName, path: file.path }), e);
-            }
+				if ((isEncryptAction && !isEnc) || (!isEncryptAction && isEnc)) {
+					// 接入带有校验恢复机制的安全转换流
+					const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action, pwd);
+					if (success) successCount++;
+				}
+			} catch (e) {
+				const actionName = isEncryptAction ? i18n.t('MODE_ENCRYPT') : i18n.t('MODE_DECRYPT');
+				console.error(i18n.t('LOG_BATCH_ERROR', { action: actionName, path: file.path }), e);
+			}
 		}
 
+		progressNotice.hide(); // 处理完后关闭进度条
 		new Notice(i18n.t('NOTICE_BATCH_FINISH', { count: successCount }));
 		void this.updateStatusBar(this.app.workspace.getActiveFile());
 	}
 
 	async loadSettings() {
 		const loadedData = (await this.loadData()) as unknown;
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData as Partial<PhantomCipherSettings>); 
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData as Partial<PhantomCipherSettings>);
 	}
 
-	async saveSettings() { 
-		await this.saveData(this.settings); 
+	async saveSettings() {
+		await this.saveData(this.settings);
 	}
 }
 
@@ -931,6 +957,16 @@ class CryptoSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
+			.setName(i18n.t('ENCRYPT_MEDIA'))
+			.setDesc(i18n.t('ENCRYPT_MEDIA_DESC'))
+			.addToggle(t => t
+				.setValue(this.plugin.settings.encryptMedia)
+				.onChange(async v => {
+					this.plugin.settings.encryptMedia = v;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
 			.setName(i18n.t('MASTER_KEY'))
 			.setDesc(i18n.t('MASTER_KEY_DESC'))
 			.addComponent(el => {
@@ -941,7 +977,7 @@ class CryptoSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 						await this.plugin.fetchPassword();
 					});
-				
+
 				return component;
 			});
 	}

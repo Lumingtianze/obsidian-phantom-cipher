@@ -25,6 +25,10 @@ PhantomCipher 为您的 Obsidian 库提供无缝的透明加密体验。
 3. 将 **运行模式** 设置为“自动加密”。
 4. 通过 **功能区图标** 或 **右键菜单** 手动转换单个文件或文件夹的加密状态。
 
+## 🛠️ 解密工具
+如果您需要在 Obsidian 之外解密文件（例如插件无法使用或需要导出数据），请使用PhantomCipher CLI 解密工具：
+[PhantomCipher CLI 解密工具](https://github.com/Lumingtianze/phantom-decrypt)
+
 ## 许可协议
 
 本项目采用 [Mozilla Public License 2.0 (MPL-2.0)](./LICENSE) 协议。
