@@ -12,28 +12,29 @@ export class I18n {
     this.lang = lang;
   }
 
-  _get(key: TransItemType): string {
-    let realLang: string = this.lang;
+  private _get(key: TransItemType): string {
+    let realLang: LangType = "en";
     
     if (this.lang === "auto") {
-      // 对齐 Obsidian 的 locale 格式 (如 zh-cn -> zh_cn)
       const locale = moment.locale().replace("-", "_");
-      realLang = (locale in LANGS) ? locale : "en";
+      if (locale in LANGS) {
+        realLang = locale as LangType; 
+      }
+    } else {
+      realLang = this.lang;
     }
 
-    const langDict = (LANGS[realLang as LangType] || LANGS["en"]) as Record<string, string>;
-    return langDict[key] || LANGS["en"][key] || (key as string);
+    const langDict = LANGS[realLang];
+    return langDict[key] || LANGS["en"][key] || key;
   }
 
-  /**
-   * 翻译函数：支持 {{var}} 变量替换
-   */
-  t(key: TransItemType, vars?: Record<string, any>): string {
+  t(key: TransItemType, vars?: Record<string, string | number>): string {
     const rawStr = this._get(key);
     if (!vars) return rawStr;
 
-    return rawStr.replace(/{{(\w+)}}/g, (match, p1) => {
-      return vars[p1] !== undefined ? String(vars[p1]) : match;
+    return rawStr.replace(/{{(\w+)}}/g, (match: string, p1: string) => {
+      const value = vars[p1];
+      return value !== undefined ? String(value) : match;
     });
   }
 }

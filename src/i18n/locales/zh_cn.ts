@@ -5,7 +5,7 @@ export default {
     MODE_ENCRYPT: "自动加密",
     MODE_DECRYPT: "自动还原",
     MASTER_KEY: "设置主密码",
-    MASTER_KEY_DESC: "从系统钥匙串中选择加密主密码",
+    MASTER_KEY_DESC: "連結到系統鑰匙圈以選擇或添加您的主密碼。",
     RIBBON_TEXT: "加密/还原转换",
     MENU_TEXT: "加密/还原转换",
     MENU_BATCH_ENCRYPT: "批量加密文件夹",

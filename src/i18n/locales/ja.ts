@@ -5,7 +5,7 @@ export default {
     MODE_ENCRYPT: "自動暗号化",
     MODE_DECRYPT: "自動復元",
     MASTER_KEY: "マスターパスワード設定",
-    MASTER_KEY_DESC: "システムキーチェーンから暗号化用マスターパスワードを選択します。",
+    MASTER_KEY_DESC: "システムキーチェーンに関連付け、マスターパスワードを選択または追加します。",
     RIBBON_TEXT: "暗号化/復元の切り替え",
     MENU_TEXT: "暗号化/復元の切り替え",
     MENU_BATCH_ENCRYPT: "フォルダを一括暗号化",

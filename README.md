@@ -1,4 +1,3 @@
-
 # PhantomCipher
 
 [English](./README.md) | [简体中文](./README_zh.md) | [日本語](./README_jp.md)
@@ -21,9 +20,10 @@ PhantomCipher provides a seamless transparent encryption experience for your Obs
 - **Secure Storage**: Master passwords are saved in your system's secure keychain.
 
 ## 🚀 Quick Start
-1. Set a **Secret Identifier** and your **Master Password** in settings.
-2. Change **Running Mode** to "Auto Encrypt".
-3. Use the **Ribbon Icon** or **Right-click Menu** to manually toggle encryption for specific files.
+1. Go to settings and configure the **Set master password** option. 
+2. Click **Link...** to open the system keychain, then click **Add secret...**. Set an ID (name) and enter your actual password into the **Secret value** field, then save and select it.
+3. Change **Operation mode** to "Auto-encrypt".
+4. Use the **Ribbon icon** or **Right-click menu** to manually toggle encryption for specific files or folders.
 
 ## License
 
