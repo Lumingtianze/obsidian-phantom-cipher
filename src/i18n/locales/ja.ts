@@ -1,7 +1,6 @@
 export default {
-	PLUGIN_NAME: "PhantomCipher (ファントムサイファー)",
     MODE: "動作モード",
-    MODE_DESC: "読み取り専用：現状維持；自動暗号化：保存時に暗号化；自動復元：保存時に復元。",
+    MODE_DESC: "読み取り専用：現状維持；自動暗号化：保存時に暗号化。",
     MODE_NONE: "読み取り専用",
     MODE_ENCRYPT: "自動暗号化",
     MODE_DECRYPT: "自動復元",

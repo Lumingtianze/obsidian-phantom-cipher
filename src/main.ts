@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, TFolder, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Stat, Platform } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, TFolder, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Stat, Platform, normalizePath } from 'obsidian';
 import { argon2id } from 'hash-wasm';
 import { i18n } from './i18n/helpers';
 
@@ -13,7 +13,7 @@ import { i18n } from './i18n/helpers';
  */
 
 interface PhantomCipherSettings {
-	mode: 'encrypt' | 'decrypt' | 'none';
+	mode: 'encrypt' | 'none';
 	secretName: string;
 }
 
@@ -282,7 +282,7 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		// 状态栏初始化
 		this.statusBarItem = this.addStatusBarItem();
-		this.statusBarItem.style.display = "none";
+		this.statusBarItem.addClass("phantom-cipher-status-bar");
 
 		// 功能区图标：手动转换按钮
 		this.addRibbonIcon('lock', i18n.t('RIBBON_TEXT'), async () => {
@@ -348,6 +348,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		adapter.writeBinary = this.originalWriteBinary;
 		adapter.stat = this.originalStat;
 		adapter.process = this.originalProcess;
+		adapter.getResourcePath = this.originalGetResourcePath;
 		this.app.vault.cachedRead = this.originalCachedRead;
 		this.blobUrlCache.forEach(url => URL.revokeObjectURL(url));
 		this.blobUrlCache.clear();
@@ -435,18 +436,25 @@ export default class PhantomCipherPlugin extends Plugin {
             // 如果内存缓存中有，直接返回解密后的尺寸
 			if (self.decryptedSizeCache.has(path)) {
 				stat.size = self.decryptedSizeCache.get(path)!;
-			} else {
-                // 如果缓存不存在，主动探测文件头部
+				return stat;
+			} 
+
+            if (self.decryptedPaths.has(path)) {
                 try {
-                    const head = await self.originalReadBinary(path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
-                    if (self.crypto.isEncrypted(head)) {
-                        await adapter.readBinary(path);
-                        if (self.decryptedSizeCache.has(path)) {
-                            stat.size = self.decryptedSizeCache.get(path)!;
-                        }
+                    // 仅对已知解密成功的文件进行一次读取以更新缓存
+                    const data = await self.originalReadBinary(path);
+                    const armoredText = new TextDecoder().decode(data);
+                    const decrypted = await self.crypto.decrypt(armoredText, self.getPassword() || "");
+                    if (decrypted) {
+                        const size = decrypted.byteLength;
+                        self.decryptedSizeCache.set(path, size);
+                        stat.size = size;
                     }
-                } catch (e) {}
+                } catch (e) {
+                    // 忽略探测错误，返回原始 stat
+                }
             }
+            
 			return stat;
 		};
 
@@ -572,14 +580,12 @@ export default class PhantomCipherPlugin extends Plugin {
 			const ext = path.split('.').pop()?.toLowerCase() || '';
 			const shouldCompress = !NON_COMPRESSIBLE.has(ext);
 
-			// 执行加密写入
-			// 如果是非强制模式，根据头部的探测结果决定是否加密
-			if ((self.settings.mode === 'encrypt' || isCurrentlyEncrypted) && self.settings.mode !== 'decrypt' && pwd) {
+			// 仅在明确开启加密模式，或该文件原本就是加密状态时，才执行加密写入
+			if ((self.settings.mode === 'encrypt' || isCurrentlyEncrypted) && pwd) {
 				const encrypted = await self.crypto.encrypt(data, pwd, shouldCompress);
 				self.decryptedSizeCache.set(path, data.byteLength);
 				return encrypted;
 			}
-			
 			self.decryptedSizeCache.set(path, data.byteLength);
 			return data;
 		};
@@ -659,7 +665,10 @@ export default class PhantomCipherPlugin extends Plugin {
 	 * 更新状态栏 UI 展示文件的加密状态
 	 */
 	private async updateStatusBar(file: TFile | null) {
-		if (!file) { this.statusBarItem.style.display = "none"; return; }
+		if (!file) { 
+			this.statusBarItem.hide();
+			return; 
+		}
 		try {
 			// 1. 物理状态检查（仅用于状态标展示）
 			const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
@@ -669,7 +678,12 @@ export default class PhantomCipherPlugin extends Plugin {
 			
 			this.statusBarItem.empty();
 			if (isEnc) {
-				this.statusBarItem.style.display = "inline-block";
+				this.statusBarItem.show();
+				
+				// 解密成功绿色，未成功（只读）红色
+				this.statusBarItem.toggleClass("is-transparent", isTransparent);
+				this.statusBarItem.toggleClass("is-locked", !isTransparent);
+
 				const span = this.statusBarItem.createSpan();
 				setIcon(span, "lock");
 				
@@ -677,11 +691,8 @@ export default class PhantomCipherPlugin extends Plugin {
 				if (!Platform.isMobile) {
 					span.createSpan({ text: isTransparent ? i18n.t('STATUS_TRANSPARENT') : i18n.t('STATUS_LOCKED') });
 				}
-				
-				// 颜色反馈：解密成功绿色，未成功（只读）红色
-				this.statusBarItem.style.color = isTransparent ? "var(--text-success)" : "var(--text-error)";
 			} else {
-				this.statusBarItem.style.display = "none";
+				this.statusBarItem.hide();
 			}
 
 			// 2. 预热任务队列：不论笔记本身是否加密，都要预热其中的媒体
@@ -712,7 +723,7 @@ export default class PhantomCipherPlugin extends Plugin {
 				}
 			}
 
-		} catch (e) { this.statusBarItem.style.display = "none"; }
+		} catch (e) { this.statusBarItem.hide(); }
 	}
 
 	/**
@@ -720,7 +731,7 @@ export default class PhantomCipherPlugin extends Plugin {
 	 * 逻辑：写入副本 -> 校验副本 -> 替换原件
 	 */
 	private async safeConvertProcess(path: string, extension: string, action: 'encrypt' | 'decrypt', pwd: string): Promise<boolean> {
-		const tempPath = path + ".phantom_tmp";
+		const tempPath = normalizePath(path + ".phantom_tmp");
 		try {
 			let targetData: Uint8Array | string;
 			let originalDataLength = 0;
@@ -761,8 +772,19 @@ export default class PhantomCipherPlugin extends Plugin {
 
 			// 4. 原子替换：删除原件并重命名副本
 			// 在某些情况 rename 可能会失败，先 remove 再 rename
-			await this.app.vault.adapter.remove(path);
-			await this.app.vault.adapter.rename(tempPath, path);
+			const oldAbstractFile = this.app.vault.getAbstractFileByPath(path);
+			if (oldAbstractFile) {
+				await this.app.vault.delete(oldAbstractFile);
+			}
+            
+            // 获取临时文件的抽象引用并重命名
+            const tempAbstractFile = this.app.vault.getAbstractFileByPath(tempPath);
+            if (tempAbstractFile) {
+                await this.app.vault.rename(tempAbstractFile, path);
+            } else {
+                // 如果 Vault API 没能即时识别临时文件，回退到 Adapter API 重命名
+                await this.app.vault.adapter.rename(tempPath, path);
+            }
 			
 			return true;
 
@@ -807,35 +829,43 @@ export default class PhantomCipherPlugin extends Plugin {
 		const pwd = this.getPassword();
 		if (!pwd) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
 		
-		// 递归获取所有属于此文件夹的文件
-		const allFiles = this.app.vault.getFiles();
-		const targetFiles = folder.path === '/' 
-			? allFiles 
-			: allFiles.filter(f => f.path.startsWith(folder.path + '/'));
-
 		let successCount = 0;
 		const isEncryptAction = action === 'encrypt';
+        
+        // 递归遍历目标文件夹的 children 树
+        const targetFiles: TFile[] = [];
+        const recursiveCollect = (curr: TFolder) => {
+            for (const child of curr.children) {
+                if (child instanceof TFile) {
+                    // 只收集符合处理条件的文件类型
+                    if (child.extension === 'md' || PREVIEW_SUPPORTED.has(child.extension.toLowerCase()) || NON_COMPRESSIBLE.has(child.extension.toLowerCase())) {
+                        targetFiles.push(child);
+                    }
+                } else if (child instanceof TFolder) {
+                    recursiveCollect(child);
+                }
+            }
+        };
+
+        recursiveCollect(folder);
 		
 		new Notice(i18n.t('NOTICE_BATCH_START', { count: targetFiles.length }));
 
 		for (const file of targetFiles) {
-			// 只处理 Markdown 和受支持的附件格式，跳过诸如 .obsidian 里的系统文件
-			if (file.extension === 'md' || PREVIEW_SUPPORTED.has(file.extension.toLowerCase()) || NON_COMPRESSIBLE.has(file.extension.toLowerCase())) {
-				try {
-					// 直接通过底层 Adapter 探查头信息判断状态
-					const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
-					const isEnc = this.crypto.isEncrypted(rawHead);
+            try {
+                // 直接通过底层 Adapter 探查头信息判断状态
+                const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+                const isEnc = this.crypto.isEncrypted(rawHead);
 
-					if ((isEncryptAction && !isEnc) || (!isEncryptAction && isEnc)) {
-						// 接入带有校验恢复机制的安全转换流
-						const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action, pwd);
-						if (success) successCount++;
-					}
-				} catch (e) {
-					const actionName = isEncryptAction ? i18n.t('MODE_ENCRYPT') : i18n.t('MODE_DECRYPT');
-					console.error(i18n.t('LOG_BATCH_ERROR', { action: actionName, path: file.path }), e);
-				}
-			}
+                if ((isEncryptAction && !isEnc) || (!isEncryptAction && isEnc)) {
+                    // 接入带有校验恢复机制的安全转换流
+                    const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action, pwd);
+                    if (success) successCount++;
+                }
+            } catch (e) {
+                const actionName = isEncryptAction ? i18n.t('MODE_ENCRYPT') : i18n.t('MODE_DECRYPT');
+                console.error(i18n.t('LOG_BATCH_ERROR', { action: actionName, path: file.path }), e);
+            }
 		}
 
 		new Notice(i18n.t('NOTICE_BATCH_FINISH', { count: successCount }));
@@ -854,7 +884,6 @@ class CryptoSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		containerEl.createEl('h2', { text: i18n.t('PLUGIN_NAME')});
 
 		new Setting(containerEl)
 			.setName(i18n.t('MODE'))
@@ -862,7 +891,6 @@ class CryptoSettingTab extends PluginSettingTab {
 			.addDropdown(d => d
 				.addOption('none', i18n.t('MODE_NONE'))
 				.addOption('encrypt', i18n.t('MODE_ENCRYPT'))
-				.addOption('decrypt', i18n.t('MODE_DECRYPT'))
 				.setValue(this.plugin.settings.mode)
 				.onChange(async v => {
 					this.plugin.settings.mode = v as any;

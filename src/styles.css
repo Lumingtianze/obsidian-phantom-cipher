@@ -1,0 +1,24 @@
+.status-bar-item.phantom-cipher-status-bar {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: default;
+}
+
+.status-bar-item.phantom-cipher-status-bar.is-transparent {
+    color: var(--text-success);
+}
+
+.status-bar-item.phantom-cipher-status-bar.is-locked {
+    color: var(--text-error);
+}
+
+.phantom-cipher-status-bar .clickable-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.is-mobile .phantom-cipher-status-bar {
+    font-size: 0.85em;
+}

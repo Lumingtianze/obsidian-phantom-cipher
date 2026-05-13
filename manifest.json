@@ -1,8 +1,8 @@
 {
-	"id": "obsidian-phantom-cipher",
+	"id": "phantom-cipher",
 	"name": "PhantomCipher",
-	"version": "1.0.0",
-	"minAppVersion": "1.11.0",
+	"version": "1.0.1",
+	"minAppVersion": "1.12.0",
 	"description": "A high-performance transparent full-database encryption scheme based on Argon2id + AES-GCM.",
 	"author": "Lumingtianze",
 	"authorUrl": "https://github.com/Lumingtianze",

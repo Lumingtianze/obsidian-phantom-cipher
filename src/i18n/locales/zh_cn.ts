@@ -1,7 +1,6 @@
 export default {
-    PLUGIN_NAME: "PhantomCipher (幻影加密)",
     MODE: "运行模式",
-    MODE_DESC: "仅读取：保持原状；自动加密：保存即加密；自动还原：保存即解密。",
+    MODE_DESC: "仅读取：保持原状；自动加密：保存即加密。",
     MODE_NONE: "仅读取",
     MODE_ENCRYPT: "自动加密",
     MODE_DECRYPT: "自动还原",
