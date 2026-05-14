@@ -10,6 +10,7 @@ import { i18n } from './i18n/helpers';
  * 3. 透明：拦截 Vault Adapter 底层接口，实现用户无感知的加解密。
  * 4. 缓存：引入 Session Salt (会话盐) 机制，极大提升高频写入时的响应速度。
  * 5. 内存保护：采用 XOR 内存混淆，防止密码明文在内存中长期驻留导致 Dump 泄露。
+ * 6. 结构化扩展：采用 ENC_V1:{ExtBlock}:{Payload}。ExtBlock 为基于 Key=Value&... 的紧凑元数据区，具有独立 Checksum 签名校验，支持受损隔离与降级回退。
  */
 
 interface ISecretStorage {
@@ -21,6 +22,20 @@ interface PhantomCipherSettings {
 	mode: 'encrypt' | 'none';
 	secretName: string;
 	encryptMedia: boolean;
+}
+
+// 独立的扩展数据结构，使用 2字母 短键规范避免冲突，预留同步插件联动的可能性
+interface PhantomExtensionData {
+	sz?: number; // sz (size): 原始解密后的大小 (Base36 编码)
+	
+	// --- 以下为未来预留设计的标准词汇空间，当前版本暂不装载 ---
+	// mt?: number; // mtime: 原始修改时间 Unix 时间戳 (Base36 编码，供同步插件判断真伪修改)
+	// ct?: number; // ctime: 原始创建时间 Unix 时间戳 (Base36 编码)
+	// ex?: string; // ext: 原始扩展名 (为后续方案预留，免解密即可获知 MimeType)
+
+	// cx?: string; // checksum: 扩展区自身的完整性签名校验（代码内动态生成并校验，不在此定义）
+	
+	[key: string]: string | number | undefined; // 处理未来可能引入的其他未知扩展键
 }
 
 const DEFAULT_SETTINGS: PhantomCipherSettings = {
@@ -79,6 +94,102 @@ class CryptoHelper {
 	}
 
 	/**
+	 * FNV-1a 32-bit 散列算法，用于快速生成明文扩展块的校验签名
+	 */
+	private calculateChecksum(str: string): string {
+		let hash = 0x811c9dc5;
+		for (let i = 0; i < str.length; i++) {
+			hash ^= str.charCodeAt(i);
+			hash = Math.imul(hash, 0x01000193);
+		}
+		return (hash >>> 0).toString(36);
+	}
+
+	/**
+	 * 序列化扩展结构：转为 sz=v&k2=v2&cx=HASH 的紧凑且防篡改格式
+	 */
+	private stringifyExt(ext: PhantomExtensionData): string {
+		const parts: string[] = [];
+		if (ext.sz !== undefined) parts.push(`sz=${ext.sz.toString(36)}`);
+		
+		const payload = parts.join('&');
+		if (!payload) return ""; // 空扩展
+		
+		const cx = this.calculateChecksum(payload);
+		return `${payload}&cx=${cx}`;
+	}
+
+	/**
+	 * 反序列化扩展结构：剥离签名进行散列比对，验证失败触发拦截降级
+	 */
+	private parseExt(extStr: string): PhantomExtensionData | null {
+		if (!extStr) return {};
+		
+		// 拆离散列签名区
+		const cxMatch = extStr.match(/&cx=([^&]+)$/);
+		let payload = extStr;
+		let expectedCx = '';
+		
+		if (cxMatch) {
+			expectedCx = cxMatch[1]!;
+			payload = extStr.substring(0, cxMatch.index);
+		} else {
+			// 找不到签名，意味着数据结构受损或非标准篡改，抛弃元数据
+			return null;
+		}
+
+		// 验证内容完整性
+		if (this.calculateChecksum(payload) !== expectedCx) {
+			return null; // 散列不匹配，元数据被污染，触发返回 null 以供上层降级
+		}
+
+		const data: PhantomExtensionData = {};
+		const parts = payload.split('&');
+		for (const part of parts) {
+			const [k, v] = part.split('=');
+			if (k === 'sz' && v) {
+				const parsedSize = parseInt(v, 36);
+				if (!isNaN(parsedSize)) data.sz = parsedSize;
+			} else if (k && v) {
+				data[k] = v; // 将未知/未来的扩展字段兜底保存
+			}
+		}
+		return data;
+	}
+
+	/**
+	 * 提取外置的结构化扩展数据
+	 */
+	getExtensionData(headerText: string): PhantomExtensionData | null {
+		if (!headerText.startsWith(MAGIC_HEADER)) return null;
+		
+		const body = headerText.substring(MAGIC_HEADER.length);
+		const colonIndex = body.indexOf(':');
+		
+		// 只有在存在次级分隔符冒号时，才证明是完全符合结构的新版数据
+		if (colonIndex > -1) {
+			const extStr = body.substring(0, colonIndex);
+			return this.parseExt(extStr);
+		}
+		return null;
+	}
+
+	/**
+	 * 获取纯净的 Base64 Payload
+	 * 此处逻辑与元数据提取严格隔离，确保只要冒号后面的载荷完整就能返回，不受元数据损毁影响
+	 */
+	private getBase64Payload(armoredText: string): string | null {
+		const body = armoredText.substring(MAGIC_HEADER.length);
+		const colonIndex = body.indexOf(':');
+		
+		// 冒号后方即为密文载荷，支持形如 ENC_V1::Payload (空扩展段) 的情况
+		if (colonIndex > -1) {
+			return body.substring(colonIndex + 1);
+		}
+		return null;
+	}
+
+	/**
 	 * 压缩逻辑：使用原生 CompressionStream 对数据进行 deflate 压缩
 	 */
 	private async compress(data: Uint8Array): Promise<Uint8Array> {
@@ -125,7 +236,7 @@ class CryptoHelper {
 	}
 
 	/**
-	 * 加密执行逻辑：处理压缩 -> 加密 -> 拼接 Base64
+	 * 加密执行逻辑：处理压缩 -> 加密 -> 组合完整的带元数据的加装体
 	 */
 	async encrypt(data: Uint8Array, password: string, shouldCompress: boolean): Promise<string> {
 		let payload = data;
@@ -158,15 +269,25 @@ class CryptoHelper {
 		combined.set([compressionFlag], SALT_SIZE + IV_SIZE);
 		combined.set(new Uint8Array(ciphertext), SALT_SIZE + IV_SIZE + 1);
 
-		return MAGIC_HEADER + arrayBufferToBase64(this.toBuffer(combined));
+		// 构建结构化扩展段，独立于具体加密机制
+		const extData: PhantomExtensionData = { sz: data.byteLength };
+		const extBlock = this.stringifyExt(extData);
+
+		return MAGIC_HEADER + extBlock + ":" + arrayBufferToBase64(this.toBuffer(combined));
 	}
 
 	/**
-	 * 解密执行逻辑：拆包 Base64 -> 解密 -> 处理解压
+	 * 解密执行逻辑：拆包提取基础 Base64 -> 解密 -> 处理解压
 	 */
 	async decrypt(armoredText: string, password: string): Promise<Uint8Array | null> {
 		if (!this.isEncrypted(armoredText)) return null;
-		const combined = new Uint8Array(base64ToArrayBuffer(armoredText.substring(MAGIC_HEADER.length)));
+
+		// 解密获取 Payload 时自动隔离元数据区
+		// 因此即使元数据因为外部篡改受损，只要后面的 Base64 完好，解密就不会崩溃
+		const base64Payload = this.getBase64Payload(armoredText);
+		if (!base64Payload) return null; // 完全找不到载荷分隔符才判定格式报废
+
+		const combined = new Uint8Array(base64ToArrayBuffer(base64Payload));
 		if (combined.length < SALT_SIZE + IV_SIZE + 1) return null;
 
 		const salt = combined.subarray(0, SALT_SIZE);
@@ -181,7 +302,7 @@ class CryptoHelper {
 			if (compressionFlag === 1) finalData = await this.decompress(finalData);
 			return finalData;
 		} catch {
-			return null;
+			return null; // 载荷自身 GCM 校验失败才会返回 null
 		}
 	}
 
@@ -484,34 +605,53 @@ export default class PhantomCipherPlugin extends Plugin {
             return this.originalGetResourcePath(path);
         };
 
-		// 拦截 Stat 接口。编辑器会根据 Stat 返回的 size 校验 changeset。
-		// 如果检测到是加密文件且由非同步插件访问，返回已记录的解密后大小。
+		// 拦截 Stat 接口。
+		// 优先信任由 read/decrypt 环节产生的“真实载荷长度”缓存。
+		// 若无缓存，则临时信任签名合法的元数据字段以保障 stat 性能。
 		adapter.stat = async (path: string): Promise<Stat | null> => {
 			const stat = await this.originalStat(path);
 			if (!stat || path.startsWith(configDir) || this.isSyncCaller()) return stat;
 
-			// 如果内存缓存中有，直接返回解密后的尺寸
+			// 1. 如果 read 环节已经发现了真实的解密大小，直接覆盖 stat
+			// 解决“元数据被恶意篡改但签名通过”导致的客户端大小不匹配问题
 			if (this.decryptedSizeCache.has(path)) {
 				stat.size = this.decryptedSizeCache.get(path)!;
 				return stat;
 			}
 
-			if (this.decryptedPaths.has(path)) {
-				try {
-					// 仅对已知解密成功的文件进行一次读取以更新缓存
-					const data = await this.originalReadBinary(path);
-					const armoredText = new TextDecoder().decode(data);
-					const decrypted = await this.crypto.decrypt(armoredText, this.getPassword() || "");
-					if (decrypted) {
-						const size = decrypted.byteLength;
-						this.decryptedSizeCache.set(path, size);
-						stat.size = size;
+			// 只要物理文件可能包含加密特征，就尝试嗅探头部提取逻辑大小
+			try {
+				// 2. 快速路径：尝试提取元数据
+				// 仅读取前 128 字节
+				const data = await this.originalReadBinary(path);
+				const headerData = data.byteLength > 128 ? data.slice(0, 128) : data;
+				const headerText = new TextDecoder().decode(headerData);
+				
+				if (this.crypto.isEncrypted(headerText)) {
+					const ext = this.crypto.getExtensionData(headerText);
+					// 如果扩展元数据存在且校验通过 (cx 匹配)，则信任 sz
+					if (ext && ext.sz !== undefined) {
+						this.decryptedSizeCache.set(path, ext.sz);
+						stat.size = ext.sz;
+						return stat;
 					}
-				} catch {
-					// 忽略探测错误，返回原始 stat
-				}
-			}
 
+					// 3. 降级回退：元数据受损或签名不匹配 (ext == null)
+					// 只有在元数据失效的情况下，才被迫执行全量解密以获取真实的大小
+					const pwd = this.getPassword();
+					if (pwd) {
+						const armoredText = new TextDecoder().decode(data);
+						const decrypted = await this.crypto.decrypt(armoredText, pwd);
+						if (decrypted) {
+							const realSize = decrypted.byteLength;
+							this.decryptedSizeCache.set(path, realSize);
+							stat.size = realSize;
+						}
+					}
+				}
+			} catch {
+				// 忽略探测或解密错误，返回原始 stat
+			}
 			return stat;
 		};
 
@@ -558,7 +698,7 @@ export default class PhantomCipherPlugin extends Plugin {
 			if (decrypted) {
 				this.decryptedPaths.add(path);
 				const text = new TextDecoder().decode(decrypted);
-				this.decryptedSizeCache.set(path, text.length); // 记录文本长度
+				this.decryptedSizeCache.set(path, decrypted.byteLength);
 				return text;
 			}
 
