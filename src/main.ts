@@ -33,6 +33,13 @@ const MAGIC_HEADER = "ENC_V1:";
 const SALT_SIZE = 16;
 const IV_SIZE = 12;
 
+// 限制内存中同时存在的解密媒体文件数量
+const BLOB_CACHE_LIMIT = Platform.isMobile ? 100 : 200;
+
+// 压缩阈值：2048 字节 (2KB)
+// 低于此大小的数据不进行压缩，以避免 CompressionStream 的异步调度开销超过加密本身的收益
+const COMPRESSION_THRESHOLD = 2048;
+
 // 预设不进行二次压缩的文件类型列表
 const NON_COMPRESSIBLE = new Set([
 	'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', // 图片
@@ -123,9 +130,17 @@ class CryptoHelper {
 	async encrypt(data: Uint8Array, password: string, shouldCompress: boolean): Promise<string> {
 		let payload = data;
 		let compressionFlag = 0;
-		if (shouldCompress) {
-			payload = await this.compress(data);
-			compressionFlag = 1;
+
+		// 扩展名允许且数据大小超过阈值进行压缩
+		if (shouldCompress && data.byteLength > COMPRESSION_THRESHOLD) {
+			try {
+				payload = await this.compress(data);
+				compressionFlag = 1;
+			} catch {
+				// 如果压缩失败，降级回不压缩模式，确保数据不丢失
+				payload = data;
+				compressionFlag = 0;
+			}
 		}
 		// 运行时保持盐值一致，确保同一密码下的所有文件共用一个 CryptoKey 缓存
 		if (!this.sessionSalt) {
@@ -432,6 +447,26 @@ export default class PhantomCipherPlugin extends Plugin {
 	}
 
 	/**
+     * LRU 缓存管理
+     */
+    private addToBlobCache(path: string, url: string) {
+        if (this.blobUrlCache.has(path)) {
+            URL.revokeObjectURL(this.blobUrlCache.get(path)!);
+            this.blobUrlCache.delete(path);
+        }
+        this.blobUrlCache.set(path, url);
+
+        if (this.blobUrlCache.size > BLOB_CACHE_LIMIT) {
+            const firstKey = this.blobUrlCache.keys().next().value;
+            if (firstKey) {
+                const oldUrl = this.blobUrlCache.get(firstKey)!;
+                URL.revokeObjectURL(oldUrl);
+                this.blobUrlCache.delete(firstKey);
+            }
+        }
+    }
+	
+	/**
 	 * 核心 Hook 逻辑：接管读取与写入流程
 	 */
 	private hookAdapter() {
@@ -440,9 +475,14 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		// 拦截资源路径。如果是加密媒体文件，返回解密后的 Blob URL。
 		adapter.getResourcePath = (path: string): string => {
-			if (this.blobUrlCache.has(path)) return this.blobUrlCache.get(path)!;
-			return this.originalGetResourcePath(path);
-		};
+			if (this.blobUrlCache.has(path)) {
+                const url = this.blobUrlCache.get(path)!;
+                this.blobUrlCache.delete(path);
+                this.blobUrlCache.set(path, url);
+                return url;
+            }
+            return this.originalGetResourcePath(path);
+        };
 
 		// 拦截 Stat 接口。编辑器会根据 Stat 返回的 size 校验 changeset。
 		// 如果检测到是加密文件且由非同步插件访问，返回已记录的解密后大小。
@@ -549,9 +589,10 @@ export default class PhantomCipherPlugin extends Plugin {
 				// 针对媒体文件生成 Blob URL，让 app:// 协议能显示加密图片
 				const ext = path.split('.').pop()?.toLowerCase() || '';
 				if (PREVIEW_SUPPORTED.has(ext)) {
-					if (this.blobUrlCache.has(path)) URL.revokeObjectURL(this.blobUrlCache.get(path)!);
 					const blob = new Blob([this.crypto.toBuffer(decrypted)], { type: this.getMimeType(ext) });
-					this.blobUrlCache.set(path, URL.createObjectURL(blob));
+                    const url = URL.createObjectURL(blob);
+                    // 使用 LRU 方式存储缓存
+                    this.addToBlobCache(path, url);
 				}
 				return this.crypto.toBuffer(decrypted);
 			}

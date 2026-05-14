@@ -27,7 +27,7 @@ PhantomCipher は、Obsidian 向けにシームレスな透明暗号化体験を
 
 ## 🛠️ 復元ツール
 Obsidian 以外でファイルを復号する必要がある場合（プラグインが利用できない、またはデータをエクスポートしたい場合など）、PhantomCipher CLI 復号ツールをご利用ください：
-[PhantomCipher CLI 復号ツール](https://github.com/Lumingtianze/phantom-decrypt)
+[PhantomCipher CLI 復号ツール](https://github.com/Lumingtianze/phantom_decrypt)
 
 ## ライセンス
 

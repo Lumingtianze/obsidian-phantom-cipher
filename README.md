@@ -27,7 +27,7 @@ PhantomCipher provides a seamless transparent encryption experience for your Obs
 
 ## 🛠️ Recovery
 If you need to decrypt files outside of Obsidian (for example, if the plugin is unavailable or you need to export data), please use the PhantomCipher CLI decryption tool:
-[PhantomCipher CLI Decryptor](https://github.com/Lumingtianze/phantom-decrypt)
+[PhantomCipher CLI Decryptor](https://github.com/Lumingtianze/phantom_decrypt)
 
 ## License
 

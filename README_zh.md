@@ -27,7 +27,7 @@ PhantomCipher 为您的 Obsidian 库提供无缝的透明加密体验。
 
 ## 🛠️ 解密工具
 如果您需要在 Obsidian 之外解密文件（例如插件无法使用或需要导出数据），请使用PhantomCipher CLI 解密工具：
-[PhantomCipher CLI 解密工具](https://github.com/Lumingtianze/phantom-decrypt)
+[PhantomCipher CLI 解密工具](https://github.com/Lumingtianze/phantom_decrypt)
 
 ## 许可协议
 
