@@ -27,14 +27,14 @@ interface PhantomCipherSettings {
 // 独立的扩展数据结构，使用 2字母 短键规范避免冲突，预留同步插件联动的可能性
 interface PhantomExtensionData {
 	sz?: number; // sz (size): 原始解密后的大小 (Base36 编码)
-	
+
 	// --- 以下为未来预留设计的标准词汇空间，当前版本暂不装载 ---
 	// mt?: number; // mtime: 原始修改时间 Unix 时间戳 (Base36 编码，供同步插件判断真伪修改)
 	// ct?: number; // ctime: 原始创建时间 Unix 时间戳 (Base36 编码)
 	// ex?: string; // ext: 原始扩展名 (为后续方案预留，免解密即可获知 MimeType)
 
 	// cx?: string; // checksum: 扩展区自身的完整性签名校验（代码内动态生成并校验，不在此定义）
-	
+
 	[key: string]: string | number | undefined; // 处理未来可能引入的其他未知扩展键
 }
 
@@ -94,15 +94,65 @@ class CryptoHelper {
 	}
 
 	/**
-	 * FNV-1a 32-bit 散列算法，用于快速生成明文扩展块的校验签名
+	 * MurmurHash3 32-bit 实现
+	 * 优于 FNV-1a，具有更好的雪崩效应和更低的碰撞率
+	 * 扩展扩展数据块的数据块的快速校验
 	 */
-	private calculateChecksum(str: string): string {
-		let hash = 0x811c9dc5;
-		for (let i = 0; i < str.length; i++) {
-			hash ^= str.charCodeAt(i);
-			hash = Math.imul(hash, 0x01000193);
+	private calculateChecksum(str: string, seed: number = 0x12345678): string {
+		const data = new TextEncoder().encode(str);
+		const nblocks = Math.floor(data.length / 4);
+		let h1 = seed;
+
+		const c1 = 0xcc9e2d51;
+		const c2 = 0x1b873593;
+
+		// 块处理 (每 4 字节一组)
+		for (let i = 0; i < nblocks; i++) {
+			const index = i * 4;
+			// 模拟小端序读取 32 位整数
+			let k1 = (data[index]!) |
+				(data[index + 1]! << 8) |
+				(data[index + 2]! << 16) |
+				(data[index + 3]! << 24);
+
+			k1 = Math.imul(k1, c1);
+			k1 = (k1 << 15) | (k1 >>> 17);
+			k1 = Math.imul(k1, c2);
+
+			h1 ^= k1;
+			h1 = (h1 << 13) | (h1 >>> 19);
+			h1 = Math.imul(h1, 5) + 0xe6546b64;
 		}
-		return (hash >>> 0).toString(36);
+
+		// 尾部处理
+		let k2 = 0;
+		const tailIndex = nblocks * 4;
+		const remaining = data.length % 4;
+
+		if (remaining >= 3) {
+			k2 ^= data[tailIndex + 2]! << 16;
+		}
+		if (remaining >= 2) {
+			k2 ^= data[tailIndex + 1]! << 8;
+		}
+		if (remaining >= 1) {
+			k2 ^= data[tailIndex]!;
+			k2 = Math.imul(k2, c1);
+			k2 = (k2 << 15) | (k2 >>> 17);
+			k2 = Math.imul(k2, c2);
+			h1 ^= k2;
+		}
+
+		// 最终混淆
+		h1 ^= data.length;
+		h1 ^= h1 >>> 16;
+		h1 = Math.imul(h1, 0x85ebca6b);
+		h1 ^= h1 >>> 13;
+		h1 = Math.imul(h1, 0xc2b2ae35);
+		h1 ^= h1 >>> 16;
+
+		// 使用 Base36 编码返回
+		return (h1 >>> 0).toString(36);
 	}
 
 	/**
@@ -111,10 +161,10 @@ class CryptoHelper {
 	private stringifyExt(ext: PhantomExtensionData): string {
 		const parts: string[] = [];
 		if (ext.sz !== undefined) parts.push(`sz=${ext.sz.toString(36)}`);
-		
+
 		const payload = parts.join('&');
 		if (!payload) return ""; // 空扩展
-		
+
 		const cx = this.calculateChecksum(payload);
 		return `${payload}&cx=${cx}`;
 	}
@@ -124,12 +174,12 @@ class CryptoHelper {
 	 */
 	private parseExt(extStr: string): PhantomExtensionData | null {
 		if (!extStr) return {};
-		
+
 		// 拆离散列签名区
 		const cxMatch = extStr.match(/&cx=([^&]+)$/);
 		let payload = extStr;
 		let expectedCx = '';
-		
+
 		if (cxMatch) {
 			expectedCx = cxMatch[1]!;
 			payload = extStr.substring(0, cxMatch.index);
@@ -162,10 +212,10 @@ class CryptoHelper {
 	 */
 	getExtensionData(headerText: string): PhantomExtensionData | null {
 		if (!headerText.startsWith(MAGIC_HEADER)) return null;
-		
+
 		const body = headerText.substring(MAGIC_HEADER.length);
 		const colonIndex = body.indexOf(':');
-		
+
 		// 只有在存在次级分隔符冒号时，才证明是完全符合结构的新版数据
 		if (colonIndex > -1) {
 			const extStr = body.substring(0, colonIndex);
@@ -181,7 +231,7 @@ class CryptoHelper {
 	private getBase64Payload(armoredText: string): string | null {
 		const body = armoredText.substring(MAGIC_HEADER.length);
 		const colonIndex = body.indexOf(':');
-		
+
 		// 冒号后方即为密文载荷，支持形如 ENC_V1::Payload (空扩展段) 的情况
 		if (colonIndex > -1) {
 			return body.substring(colonIndex + 1);
@@ -568,25 +618,25 @@ export default class PhantomCipherPlugin extends Plugin {
 	}
 
 	/**
-     * LRU 缓存管理
-     */
-    private addToBlobCache(path: string, url: string) {
-        if (this.blobUrlCache.has(path)) {
-            URL.revokeObjectURL(this.blobUrlCache.get(path)!);
-            this.blobUrlCache.delete(path);
-        }
-        this.blobUrlCache.set(path, url);
+	 * LRU 缓存管理
+	 */
+	private addToBlobCache(path: string, url: string) {
+		if (this.blobUrlCache.has(path)) {
+			URL.revokeObjectURL(this.blobUrlCache.get(path)!);
+			this.blobUrlCache.delete(path);
+		}
+		this.blobUrlCache.set(path, url);
 
-        if (this.blobUrlCache.size > BLOB_CACHE_LIMIT) {
-            const firstKey = this.blobUrlCache.keys().next().value;
-            if (firstKey) {
-                const oldUrl = this.blobUrlCache.get(firstKey)!;
-                URL.revokeObjectURL(oldUrl);
-                this.blobUrlCache.delete(firstKey);
-            }
-        }
-    }
-	
+		if (this.blobUrlCache.size > BLOB_CACHE_LIMIT) {
+			const firstKey = this.blobUrlCache.keys().next().value;
+			if (firstKey) {
+				const oldUrl = this.blobUrlCache.get(firstKey)!;
+				URL.revokeObjectURL(oldUrl);
+				this.blobUrlCache.delete(firstKey);
+			}
+		}
+	}
+
 	/**
 	 * 核心 Hook 逻辑：接管读取与写入流程
 	 */
@@ -597,13 +647,13 @@ export default class PhantomCipherPlugin extends Plugin {
 		// 拦截资源路径。如果是加密媒体文件，返回解密后的 Blob URL。
 		adapter.getResourcePath = (path: string): string => {
 			if (this.blobUrlCache.has(path)) {
-                const url = this.blobUrlCache.get(path)!;
-                this.blobUrlCache.delete(path);
-                this.blobUrlCache.set(path, url);
-                return url;
-            }
-            return this.originalGetResourcePath(path);
-        };
+				const url = this.blobUrlCache.get(path)!;
+				this.blobUrlCache.delete(path);
+				this.blobUrlCache.set(path, url);
+				return url;
+			}
+			return this.originalGetResourcePath(path);
+		};
 
 		// 拦截 Stat 接口。
 		// 优先信任由 read/decrypt 环节产生的“真实载荷长度”缓存。
@@ -626,7 +676,7 @@ export default class PhantomCipherPlugin extends Plugin {
 				const data = await this.originalReadBinary(path);
 				const headerData = data.byteLength > 128 ? data.slice(0, 128) : data;
 				const headerText = new TextDecoder().decode(headerData);
-				
+
 				if (this.crypto.isEncrypted(headerText)) {
 					const ext = this.crypto.getExtensionData(headerText);
 					// 如果扩展元数据存在且校验通过 (cx 匹配)，则信任 sz
@@ -730,9 +780,9 @@ export default class PhantomCipherPlugin extends Plugin {
 				const ext = path.split('.').pop()?.toLowerCase() || '';
 				if (PREVIEW_SUPPORTED.has(ext)) {
 					const blob = new Blob([this.crypto.toBuffer(decrypted)], { type: this.getMimeType(ext) });
-                    const url = URL.createObjectURL(blob);
-                    // 使用 LRU 方式存储缓存
-                    this.addToBlobCache(path, url);
+					const url = URL.createObjectURL(blob);
+					// 使用 LRU 方式存储缓存
+					this.addToBlobCache(path, url);
 				}
 				return this.crypto.toBuffer(decrypted);
 			}
@@ -1005,10 +1055,10 @@ export default class PhantomCipherPlugin extends Plugin {
 			}
 
 			// 转换成功后，强制 Obsidian 重新读取并建立索引
-            const file = this.app.vault.getAbstractFileByPath(path);
-            if (file instanceof TFile) {
-                this.app.metadataCache.trigger("changed", file);
-            }
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) {
+				this.app.metadataCache.trigger("changed", file);
+			}
 			return true;
 
 		} catch (e) {
@@ -1082,11 +1132,11 @@ export default class PhantomCipherPlugin extends Plugin {
 		const progressNotice = new Notice(i18n.t('NOTICE_BATCH_START', { count: targetFiles.length }), 0);
 
 		for (let i = 0; i < targetFiles.length; i++) {
-            const file = targetFiles[i]!;
-            // 更新进度条文字
-            progressNotice.setMessage(`🚀 ${i18n.t(isEncryptAction ? 'MODE_ENCRYPT' : 'MODE_DECRYPT')}... (${i + 1}/${targetFiles.length})`);
-            
-            try {
+			const file = targetFiles[i]!;
+			// 更新进度条文字
+			progressNotice.setMessage(`🚀 ${i18n.t(isEncryptAction ? 'MODE_ENCRYPT' : 'MODE_DECRYPT')}... (${i + 1}/${targetFiles.length})`);
+
+			try {
 				// 直接通过底层 Adapter 探查头信息判断状态
 				const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
 				const isEnc = this.crypto.isEncrypted(rawHead);
