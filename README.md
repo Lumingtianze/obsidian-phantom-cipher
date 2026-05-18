@@ -7,28 +7,33 @@
 PhantomCipher provides a seamless transparent encryption experience for your Obsidian vault.
 
 > [!CAUTION]
-> - This plugin is for personal use only; please do not use it to process highly confidential or core business data.
-> - Before encrypting important files, **please make sure to back up your repository**.
-> - The author is not responsible for any form of data loss.
-> - **Forgetting your password will result in permanent loss of your files.**
+> **Warnings & Disclaimers**
+> - **Early Stage**: This project is in its early stages. The encryption architecture may change at any time. Please check update logs frequently.
+> - **Not for High-Security Use**: This plugin is not designed for high-stakes confidential or core business data. Be aware that Obsidian's Secret Storage API may not be fully hardened on all platforms.
+> - **Backup Required**: Always **backup your entire vault** before encrypting important files. The author is not responsible for any data loss.
+> - **Credential Backup**: Manually save/backup your KEK (Key Encryption Key) and DEK (Data Encryption Key). For multi-device use, you must manually sync these credentials across devices to avoid file isolation.
+> - **Forgotten passwords result in permanent data loss.**
 
-## ✨ Features
-- **Argon2id + AES-GCM**: Industry-standard security to protect your data.
-- **Transparent Logic**: Intercepts read/write operations; edit your notes as usual while they are stored encrypted on disk.
-- **Compression**: Built-in Deflate compression to counteract Base64 bloat.
-- **Performance**: Optimized with "Session Salt" to ensure smooth editing even with large vaults.
-- **Secure Storage**: Master passwords are saved in your system's secure keychain.
+### ✨ Key Features
 
-## 🚀 Quick Start
-1. Go to settings and configure the **Set master password** option. 
-2. Click **Link...** to open the system keychain, then click **Add secret...**. Set an ID (name) and enter your actual password into the **Secret value** field, then save and select it.
-3. Change **Operation mode** to "Auto-encrypt".
-4. Use the **Ribbon icon** or **Right-click menu** to manually toggle encryption for specific files or folders.
+- **Envelope Encryption (V2)**: Uses KEK to wrap a DEK, allowing password changes without re-encrypting physical files.
+- **Transparent Workflow**: Intercepts low-level I/O; write normally in the editor while files are stored encrypted on disk.
+- **Built-in Compression**: Uses Deflate to offset the size increase from Base64 encoding.
+- **Large Attachment Support**: Optimized for files up to 2GB. Note: Due to JS environment limits and the "Write-Verify-Replace" safety mechanism, high-memory devices (16GB+) are recommended for very large files.
+- **Native Binary Format**: supports storing encrypted payloads in pure binary, improving performance for media files and eliminating Base64 overhead.
+- **Integrity Verification**: Manual conversion now uses **MurmurHash3 plaintext hashing** to verify data integrity before and after encryption, preventing data corruption.
 
-## 🛠️ Recovery
-If you need to decrypt files outside of Obsidian (for example, if the plugin is unavailable or you need to export data), please use the PhantomCipher CLI decryption tool:
-[PhantomCipher CLI Decryptor](https://github.com/Lumingtianze/phantom_decrypt)
+### 🚀 Quick Start
+
+1. Go to settings and select **Manage Master Password**.
+2. Set your password in the modal. The system will derive a KEK and generate a random DEK stored in Obsidian's Secret Storage.
+3. **Important**: Manually back up your `secrets.json` in the Obsidian config folder or record your key IDs.
+4. Set **Operation mode** to "Auto-encrypt".
+5. Use the **Ribbon Icon** or **Context Menu** to toggle encryption for files or folders.
+
+## 🛠️ Decryption Tool
+To decrypt files outside of Obsidian (e.g., for data export), use our CLI tool:
+[PhantomCipher CLI Tool](https://github.com/Lumingtianze/phantom_decrypt)
 
 ## License
-
 This project is licensed under the [Mozilla Public License 2.0 (MPL-2.0)](./LICENSE).
