@@ -97,136 +97,136 @@ class CryptoHelper {
 		return fixed;
 	}
 
-// /**
-//  * MurmurHash3 32-bit 实现
-//  * 优于 FNV-1a，具有更好的雪崩效应和更低的碰撞率
-//  * 扩展扩展数据块的数据块的快速校验
-//  */
-// private calculateChecksum(str: string, seed: number = 0x12345678): string {
-// 	const data = new TextEncoder().encode(str);
-// 	const nblocks = Math.floor(data.length / 4);
-// 	let h1 = seed;
-//
-// 	const c1 = 0xcc9e2d51;
-// 	const c2 = 0x1b873593;
-//
-// 	// 块处理 (每 4 字节一组)
-// 	for (let i = 0; i < nblocks; i++) {
-// 		const index = i * 4;
-// 		// 模拟小端序读取 32 位整数
-// 		let k1 = (data[index]!) |
-// 			(data[index + 1]! << 8) |
-// 			(data[index + 2]! << 16) |
-// 			(data[index + 3]! << 24);
-//
-// 		k1 = Math.imul(k1, c1);
-// 		k1 = (k1 << 15) | (k1 >>> 17);
-// 		k1 = Math.imul(k1, c2);
-//
-// 		h1 ^= k1;
-// 		h1 = (h1 << 13) | (h1 >>> 19);
-// 		h1 = Math.imul(h1, 5) + 0xe6546b64;
-// 	}
-//
-// 	// 尾部处理
-// 	let k2 = 0;
-// 	const tailIndex = nblocks * 4;
-// 	const remaining = data.length % 4;
-//
-// 	if (remaining >= 3) {
-// 		k2 ^= data[tailIndex + 2]! << 16;
-// 	}
-// 	if (remaining >= 2) {
-// 		k2 ^= data[tailIndex + 1]! << 8;
-// 	}
-// 	if (remaining >= 1) {
-// 		k2 ^= data[tailIndex]!;
-// 		k2 = Math.imul(k2, c1);
-// 		k2 = (k2 << 15) | (k2 >>> 17);
-// 		k2 = Math.imul(k2, c2);
-// 		h1 ^= k2;
-// 	}
-//
-// 	// 最终混淆
-// 	h1 ^= data.length;
-// 	h1 ^= h1 >>> 16;
-// 	h1 = Math.imul(h1, 0x85ebca6b);
-// 	h1 ^= h1 >>> 13;
-// 	h1 = Math.imul(h1, 0xc2b2ae35);
-// 	h1 ^= h1 >>> 16;
-//
-// 	// 使用 Base36 编码返回
-// 	return (h1 >>> 0).toString(36);
-// }
+	// /**
+	//  * MurmurHash3 32-bit 实现
+	//  * 优于 FNV-1a，具有更好的雪崩效应和更低的碰撞率
+	//  * 扩展扩展数据块的数据块的快速校验
+	//  */
+	// private calculateChecksum(str: string, seed: number = 0x12345678): string {
+	// 	const data = new TextEncoder().encode(str);
+	// 	const nblocks = Math.floor(data.length / 4);
+	// 	let h1 = seed;
+	//
+	// 	const c1 = 0xcc9e2d51;
+	// 	const c2 = 0x1b873593;
+	//
+	// 	// 块处理 (每 4 字节一组)
+	// 	for (let i = 0; i < nblocks; i++) {
+	// 		const index = i * 4;
+	// 		// 模拟小端序读取 32 位整数
+	// 		let k1 = (data[index]!) |
+	// 			(data[index + 1]! << 8) |
+	// 			(data[index + 2]! << 16) |
+	// 			(data[index + 3]! << 24);
+	//
+	// 		k1 = Math.imul(k1, c1);
+	// 		k1 = (k1 << 15) | (k1 >>> 17);
+	// 		k1 = Math.imul(k1, c2);
+	//
+	// 		h1 ^= k1;
+	// 		h1 = (h1 << 13) | (h1 >>> 19);
+	// 		h1 = Math.imul(h1, 5) + 0xe6546b64;
+	// 	}
+	//
+	// 	// 尾部处理
+	// 	let k2 = 0;
+	// 	const tailIndex = nblocks * 4;
+	// 	const remaining = data.length % 4;
+	//
+	// 	if (remaining >= 3) {
+	// 		k2 ^= data[tailIndex + 2]! << 16;
+	// 	}
+	// 	if (remaining >= 2) {
+	// 		k2 ^= data[tailIndex + 1]! << 8;
+	// 	}
+	// 	if (remaining >= 1) {
+	// 		k2 ^= data[tailIndex]!;
+	// 		k2 = Math.imul(k2, c1);
+	// 		k2 = (k2 << 15) | (k2 >>> 17);
+	// 		k2 = Math.imul(k2, c2);
+	// 		h1 ^= k2;
+	// 	}
+	//
+	// 	// 最终混淆
+	// 	h1 ^= data.length;
+	// 	h1 ^= h1 >>> 16;
+	// 	h1 = Math.imul(h1, 0x85ebca6b);
+	// 	h1 ^= h1 >>> 13;
+	// 	h1 = Math.imul(h1, 0xc2b2ae35);
+	// 	h1 ^= h1 >>> 16;
+	//
+	// 	// 使用 Base36 编码返回
+	// 	return (h1 >>> 0).toString(36);
+	// }
 
-// /**
-//  * 序列化扩展结构：转为 sz=v&k2=v2&cx=HASH 的紧凑且防篡改格式
-//  */
-// private stringifyExt(ext: PhantomExtensionData): string {
-// 	const parts: string[] = [];
-// 	if (ext.sz !== undefined) parts.push(`sz=${ext.sz.toString(36)}`);
-//
-// 	const payload = parts.join('&');
-// 	if (!payload) return ""; // 空扩展
-//
-// 	const cx = this.calculateChecksum(payload);
-// 	return `${payload}&cx=${cx}`;
-// }
+	// /**
+	//  * 序列化扩展结构：转为 sz=v&k2=v2&cx=HASH 的紧凑且防篡改格式
+	//  */
+	// private stringifyExt(ext: PhantomExtensionData): string {
+	// 	const parts: string[] = [];
+	// 	if (ext.sz !== undefined) parts.push(`sz=${ext.sz.toString(36)}`);
+	//
+	// 	const payload = parts.join('&');
+	// 	if (!payload) return ""; // 空扩展
+	//
+	// 	const cx = this.calculateChecksum(payload);
+	// 	return `${payload}&cx=${cx}`;
+	// }
 
-// /**
-//  * 反序列化扩展结构：剥离签名进行散列比对，验证失败触发拦截降级
-//  */
-// private parseExt(extStr: string): PhantomExtensionData | null {
-// 	if (!extStr) return {};
-//
-// 	// 拆离散列签名区
-// 	const cxMatch = extStr.match(/&cx=([^&]+)$/);
-// 	let payload = extStr;
-// 	let expectedCx = '';
-//
-// 	if (cxMatch) {
-// 		expectedCx = cxMatch[1]!;
-// 		payload = extStr.substring(0, cxMatch.index);
-// 	} else {
-// 		// 找不到签名，意味着数据结构受损或非标准篡改，抛弃元数据
-// 		return null;
-// 	}
-//
-// 	// 验证内容完整性
-// 	if (this.calculateChecksum(payload) !== expectedCx) {
-// 		return null; // 散列不匹配，元数据被污染，触发返回 null 以供上层降级
-// 	}
-//
-// 	const data: PhantomExtensionData = {};
-// 	const parts = payload.split('&');
-// 	for (const part of parts) {
-// 		const [k, v] = part.split('=');
-// 		if (k === 'sz' && v) {
-// 			const parsedSize = parseInt(v, 36);
-// 			if (!isNaN(parsedSize)) data.sz = parsedSize;
-// 		} else if (k && v) {
-// 			data[k] = v; // 将未知/未来的扩展字段兜底保存
-// 		}
-// 	}
-// 	return data;
-// }
+	// /**
+	//  * 反序列化扩展结构：剥离签名进行散列比对，验证失败触发拦截降级
+	//  */
+	// private parseExt(extStr: string): PhantomExtensionData | null {
+	// 	if (!extStr) return {};
+	//
+	// 	// 拆离散列签名区
+	// 	const cxMatch = extStr.match(/&cx=([^&]+)$/);
+	// 	let payload = extStr;
+	// 	let expectedCx = '';
+	//
+	// 	if (cxMatch) {
+	// 		expectedCx = cxMatch[1]!;
+	// 		payload = extStr.substring(0, cxMatch.index);
+	// 	} else {
+	// 		// 找不到签名，意味着数据结构受损或非标准篡改，抛弃元数据
+	// 		return null;
+	// 	}
+	//
+	// 	// 验证内容完整性
+	// 	if (this.calculateChecksum(payload) !== expectedCx) {
+	// 		return null; // 散列不匹配，元数据被污染，触发返回 null 以供上层降级
+	// 	}
+	//
+	// 	const data: PhantomExtensionData = {};
+	// 	const parts = payload.split('&');
+	// 	for (const part of parts) {
+	// 		const [k, v] = part.split('=');
+	// 		if (k === 'sz' && v) {
+	// 			const parsedSize = parseInt(v, 36);
+	// 			if (!isNaN(parsedSize)) data.sz = parsedSize;
+	// 		} else if (k && v) {
+	// 			data[k] = v; // 将未知/未来的扩展字段兜底保存
+	// 		}
+	// 	}
+	// 	return data;
+	// }
 
-// /**
-//  * 提取外置的结构化扩展数据
-//  */
-// getExtensionData(headerText: string): PhantomExtensionData | null {
-// 	if (!headerText.startsWith(MAGIC_HEADER)) return null;
-//
-// 	const body = headerText.substring(MAGIC_HEADER.length);
-// 	const colonIndex = body.indexOf(':');
-//
-// 	// 只有在存在次级分隔符冒号时，才证明是完全符合结构的新版数据
-// 	if (colonIndex > -1) {
-// 		const extStr = body.substring(0, colonIndex);
-// 		return this.parseExt(extStr);
-// 	}
-// 	return null;
-// }
+	// /**
+	//  * 提取外置的结构化扩展数据
+	//  */
+	// getExtensionData(headerText: string): PhantomExtensionData | null {
+	// 	if (!headerText.startsWith(MAGIC_HEADER)) return null;
+	//
+	// 	const body = headerText.substring(MAGIC_HEADER.length);
+	// 	const colonIndex = body.indexOf(':');
+	//
+	// 	// 只有在存在次级分隔符冒号时，才证明是完全符合结构的新版数据
+	// 	if (colonIndex > -1) {
+	// 		const extStr = body.substring(0, colonIndex);
+	// 		return this.parseExt(extStr);
+	// 	}
+	// 	return null;
+	// }
 
 	/**
 	 * 获取纯净的 Base64 Payload
@@ -407,7 +407,7 @@ export default class PhantomCipherPlugin extends Plugin {
 	private originalWriteBinary!: (path: string, data: ArrayBuffer, options?: DataWriteOptions) => Promise<void>;
 	private originalProcess!: (path: string, fn: (data: string) => string, options?: DataWriteOptions) => Promise<string>;
 	private originalGetResourcePath!: (path: string) => string;
-	
+
 	// 备份 Vault 层原生方法。解密操作移交逻辑层，以遵循官方安全分层规范
 	private originalVaultRead!: (file: TFile) => Promise<string>;
 	private originalVaultReadBinary!: (file: TFile) => Promise<ArrayBuffer>;
@@ -614,7 +614,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		adapter.writeBinary = this.originalWriteBinary;
 		adapter.process = this.originalProcess;
 		adapter.getResourcePath = this.originalGetResourcePath;
-		
+
 		// 还原逻辑层的方法
 		const vault = this.app.vault;
 		vault.read = this.originalVaultRead;
@@ -813,7 +813,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		const handleWrite = async (path: string, data: Uint8Array): Promise<string | Uint8Array | null> => {
 			if (path.startsWith(configDir)) {
 				return data;
-			} 
+			}
 
 			if (!this.hasPassword()) await this.fetchPassword();
 			const hasPwd = this.hasPassword();
@@ -828,21 +828,56 @@ export default class PhantomCipherPlugin extends Plugin {
 				// 合规地忽略文件无法探测的初始化情况
 			}
 
-			// 如果磁盘上的文件是加密的，但内存集合中没有该路径（说明未成功解密过）
-			// 此时绝对禁止任何写入。哪怕用户删掉了编辑器里的加密头，也知道它是加密文件。
+			// 判断即将写入的内容本身是否带有加密头标识
+			const isIncomingEncrypted = this.crypto.isEncrypted(data);
+
+			// 零信任安全校验：严防中间人与脏密文注入
+			// 一旦检测到试图写入系统的密文，在此处就地执行强制中转验证。
+			// 绝不允许单纯依赖特征头而放行落盘，一切非经验证合法的密文皆视为攻击或损坏。
+			if (isIncomingEncrypted) {
+				if (!hasPwd) {
+					// 若当前设备未解锁，则无法验证密文的真伪
+					// 为防止垃圾数据覆写破坏本地文件，在此刻无条件拒绝写入并利用通知提醒用户。
+					this.notifyPasswordMissing();
+					return null;
+				}
+
+				// 强制试解密即将落盘的载荷
+				const isValid = await this.withPassword(async (pwdBytes) => {
+					const armoredText = new TextDecoder().decode(data);
+					const decrypted = await this.crypto.decrypt(armoredText, pwdBytes);
+					if (decrypted) {
+						decrypted.fill(0); // 验证通过即刻销毁明文内存
+						return true;
+					}
+					return false;
+				});
+
+				if (isValid) {
+					// 验证通过：确认为当前密码下合法的密文（如同步插件写入）
+					// 立刻将此文件路径加入已信任名单，并将中转的 data 原路返回给底层完成物理落盘。
+					this.decryptedPaths.add(path);
+					return data;
+				} else {
+					// 验证失败：载荷损坏、不同密码或蓄意伪造
+					// 向用户抛出具有具体文件名的警告，并拒绝写入保护本地文件。
+					this.notifyDecryptFailed(path);
+					return null;
+				}
+			}
+
+			// 以下为即将写入明文数据时的处理
+
+			// 如果磁盘上的文件是加密的，但内存集合中没有该路径（说明本次会话中从未成功解密验证过）
+			// 此时绝对禁止任何覆盖写入。防止其他插件不知情地把空白或错误明文覆写到未解锁的加密文件上。
 			if (isCurrentlyEncrypted && !this.decryptedPaths.has(path)) {
 				return null; // 静默拦截物理写入
 			}
 
-			// 如果文件已经加密直接返回
-			if (this.crypto.isEncrypted(data)) {
-				return data;
-			}
-
 			const isMedia = PREVIEW_SUPPORTED.has(ext);
 
-			// 只有当满足以下任一条件时，才执行加密写入：
-			// - 该文件当前在磁盘上已经是加密状态（必须维持一致性，防止因开关关闭导致自动解密）
+			// 只有当满足以下任一条件时，才执行明文加密并落地：
+			// - 该文件当前在磁盘上已经是加密状态（维持一致性）
 			// - 处于自动加密模式，且（不是媒体文件 或 开启了媒体加密开关）
 			const shouldEncrypt = hasPwd && (
 				isCurrentlyEncrypted ||
@@ -854,11 +889,13 @@ export default class PhantomCipherPlugin extends Plugin {
 					return await this.crypto.encrypt(data, pwdBytes, !NON_COMPRESSIBLE.has(ext));
 				});
 				if (encryptedResult) {
+					// 自身完成加密落盘后同步录入信任名单
+					this.decryptedPaths.add(path);
 					return encryptedResult;
 				}
 			}
 
-			// 不满足加密条件，执行明文写入
+			// 不满足加密条件，执行正常的明文放行
 			return data;
 		};
 
