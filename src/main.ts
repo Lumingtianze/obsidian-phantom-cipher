@@ -1,55 +1,60 @@
-import { App, Plugin, PluginSettingTab, Setting, SecretComponent, Notice, TFile, TFolder, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Platform, normalizePath } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Modal, Notice, TFile, TFolder, setIcon, arrayBufferToBase64, base64ToArrayBuffer, DataWriteOptions, Platform, normalizePath } from 'obsidian';
 import { argon2id } from 'hash-wasm';
 import { i18n } from './i18n/helpers';
 
 /**
  * PhantomCipher (幻影加密)
  * 核心设计：基于 Argon2id + AES-GCM 的高性能透明加解密方案。
- * 1. 算法：使用 Argon2id 派生密钥 + AES-GCM 认证加密。
- * 2. 压缩：内置 Deflate 压缩流，用于抵消 Base64 编码带来的体积膨胀。
- * 3. 透明：拦截 Vault Adapter 底层接口，实现用户无感知的加解密。
- * 4. 缓存：引入 Session Salt (会话盐) 机制，极大提升高频写入时的响应速度。
- * 5. 内存保护：采用 XOR 内存混淆，防止密码明文在内存中长期驻留导致 Dump 泄露。
- * 6. 结构化扩展：采用 ENC_V1:{ExtBlock}:{Payload}。ExtBlock 为基于 Key=Value&... 的紧凑元数据区，具有独立 Checksum 签名校验，支持受损隔离与降级回退。
  * 
- * 架构：基于官方 API 规范的逻辑层与物理层分离。
- * - Adapter (物理层)：放开 read/stat，拦截 write 以保证加密落盘。兼容同步插件，同步插件可直接拿取底层密文，防止冲突。
- * - Vault (逻辑层)：拦截 read/cachedRead/process，为编辑器 UI 动态提供明文。
+ * 1. 架构：引入 KEK (密钥加密密钥) 与 DEK (数据加密密钥) 的信封加密架构。
+ *    - 用户密码 -> Argon2id -> KEK。
+ *    - 随机生成库全局 DEK。KEK 加密 DEK 得到 EDEK。
+ *    - 文件载荷一律使用 DEK 加密。文件头存储 EDEK 以实现独立自愈。
+ * 2. 存储：不再存储明文密码。SecretStorage (钥匙串) 仅安全存储 KEK (Base64) 与 EDEK (Base64)。
+ * 3. 隔离：增加 KID (Key ID) 标识。提取 KEK Base64 的前 6 位，用于快速识别跨端文件的密钥归属，防止破坏。
+ * 4. 压缩：内置 Deflate 压缩流，用于抵消 Base64 编码带来的体积膨胀。
+ * 5. 透明：拦截 Vault Adapter 底层接口，实现用户无感知的加解密。
+ * 6. 内存保护：采用 XOR 内存混淆，防止 KEK/DEK 明文在内存中长期驻留导致 Dump 泄露。
+ * 7. 结构化扩展：采用 ENC_V2:{ExtBlock}:{Payload}。ExtBlock 为基于 Key=Value&... 的紧凑元数据区。
  */
 
 interface PhantomCipherSettings {
 	mode: 'encrypt' | 'none';
-	secretName: string;
 	encryptMedia: boolean;
+	kekId: string;
+	dekId: string;
 }
 
-// 由于当前架构无需读取元数据，暂时将 ExtBlock 相关定义与处理函数注释保留
-// 文件头部结构精简为 ENC_V1::Payload。等未来有需要再开启。
-/*
 // 独立的扩展数据结构，使用 2字母 短键规范避免冲突，预留同步插件联动的可能性
 interface PhantomExtensionData {
 	sz?: number; // sz (size): 原始解密后的大小 (Base36 编码)
-
-	// --- 以下为未来预留设计的标准词汇空间，当前版本暂不装载 ---
-	// mt?: number; // mtime: 原始修改时间 Unix 时间戳 (Base36 编码，供同步插件判断真伪修改)
-	// ct?: number; // ctime: 原始创建时间 Unix 时间戳 (Base36 编码)
-	// ex?: string; // ext: 原始扩展名 (为后续方案预留，免解密即可获知 MimeType)
-
-	// cx?: string; // checksum: 扩展区自身的完整性签名校验（代码内动态生成并校验，不在此定义）
-
-	[key: string]: string | number | undefined; // 处理未来可能引入的其他未知扩展键
+	ph?: string; // ph (plaintext hash): 加密前明文的 MurmurHash3 校验和，用于解密安全转换校验
+	cp?: number; // cp (compression): V2 压缩标识，1 为启用，0 为未压缩
+	kid?: string; // kid (Key ID): 当前 KEK 的前 6 位截断标识符，用于阻断未知密钥覆写
+	ek?: string; // ek (EDEK): 被 KEK 加密的专属 DEK 数据包
+	bf?: number; // bf (binary format): 1 代表当前密文载荷为纯二进制原生拼合，0 代表 Base64 字符串
+	_isValid?: boolean; // 内部标记：元数据校验和是否通过
+	[key: string]: string | number | boolean | undefined;  // 处理未来可能引入的其他未知扩展键
 }
-*/
 
 const DEFAULT_SETTINGS: PhantomCipherSettings = {
 	mode: 'none',
-	secretName: '',
-	encryptMedia: false
+	encryptMedia: false,
+	kekId: '',
+	dekId: ''
 };
 
-const MAGIC_HEADER = "ENC_V1:";
-const SALT_SIZE = 16;
+const MAGIC_HEADER = "ENC_V2:";
+const MAGIC_HEADER_V1 = "ENC_V1:"; // 用于检测旧版降级
 const IV_SIZE = 12;
+const TAG_SIZE = 16;
+const KEK_SALT = new TextEncoder().encode("Phantom_Cipher_KEK_Salt_V2_2026");
+
+// V8 引擎的内存限制
+const MAX_FILE_SIZE = 2000 * 1024 * 1024;
+
+// 分块加密阈值：4MB
+const CHUNK_SIZE = 4 * 1024 * 1024;
 
 // 限制内存中同时存在的解密媒体文件数量
 const BLOB_CACHE_LIMIT = Platform.isMobile ? 100 : 200;
@@ -62,7 +67,7 @@ const COMPRESSION_THRESHOLD = 2048;
 const NON_COMPRESSIBLE = new Set([
 	'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', // 图片
 	'pdf', // 文档
-	'mp3', 'ogg', 'opus', 'm4a', 'flac', 'aac', // 音频
+	'mp3', 'ogg', 'opus', 'm4a', 'flac', 'aac', 'wav', // 音频
 	'mp4', 'webm', 'ogv', 'mov', 'mkv' // 视频
 ]);
 
@@ -74,169 +79,255 @@ const PREVIEW_SUPPORTED = new Set([
 	'mp4', 'webm', 'ogv', 'mov', 'mkv' // 视频
 ]);
 
-class CryptoHelper {
-	// 缓存密钥：使用过的密钥自动缓存
-	private keyMapCache: Map<string, CryptoKey> = new Map();
 
-	// 运行时盐值：在插件生命周期内保持一致
-	private sessionSalt: Uint8Array | null = null;
-	// 计算锁：防止多文件同时解密时 Argon2id 撑爆内存
-	private derivationPromise: Promise<CryptoKey> | null = null;
+// 供 PDF 原生渲染器劫持使用的类型声明
+interface PDFOpenArgs {
+	url?: string;
+	data?: Uint8Array;
+	[key: string]: unknown;
+}
 
-	/**
-	 * 辅助工具：提取 Uint8Array 的 ArrayBuffer 副本，确保类型兼容性
-	 */
-	public toBuffer(arr: Uint8Array): ArrayBuffer {
-		const buf = arr.buffer;
-		if (buf instanceof ArrayBuffer) {
-			return buf.slice(arr.byteOffset, arr.byteOffset + arr.byteLength);
+interface ObsidianPDFApp {
+	__phantomHooked?: boolean;
+	open: (args: PDFOpenArgs) => Promise<unknown>;
+}
+
+interface PDFViewerCreator {
+	__phantomHooked?: boolean;
+	(this: unknown, ...args: unknown[]): ObsidianPDFApp;
+}
+
+interface PDFjsViewer {
+	createObsidianPDFViewer?: PDFViewerCreator;
+}
+
+interface ObsidianWindow extends Window {
+	pdfjsViewer?: PDFjsViewer;
+}
+
+
+/**
+ * 安全内存凭证容器 (XOR 混淆)
+ * 用于将 KEK 和 DEK 的原始字节在内存中打散，防止直接扫描内存提取。
+ */
+class SecureKey {
+	private memoryKey: Uint8Array;
+	private obfuscatedData: Uint8Array;
+
+	constructor(data: Uint8Array) {
+		this.memoryKey = crypto.getRandomValues(new Uint8Array(data.length));
+		this.obfuscatedData = new Uint8Array(data.length);
+		for (let i = 0; i < data.length; i++) {
+			this.obfuscatedData[i] = data[i]! ^ this.memoryKey[i]!;
 		}
-
-		const fixed = new ArrayBuffer(arr.byteLength);
-		new Uint8Array(fixed).set(arr);
-		return fixed;
 	}
 
-	// /**
-	//  * MurmurHash3 32-bit 实现
-	//  * 优于 FNV-1a，具有更好的雪崩效应和更低的碰撞率
-	//  * 扩展扩展数据块的数据块的快速校验
-	//  */
-	// private calculateChecksum(str: string, seed: number = 0x12345678): string {
-	// 	const data = new TextEncoder().encode(str);
-	// 	const nblocks = Math.floor(data.length / 4);
-	// 	let h1 = seed;
-	//
-	// 	const c1 = 0xcc9e2d51;
-	// 	const c2 = 0x1b873593;
-	//
-	// 	// 块处理 (每 4 字节一组)
-	// 	for (let i = 0; i < nblocks; i++) {
-	// 		const index = i * 4;
-	// 		// 模拟小端序读取 32 位整数
-	// 		let k1 = (data[index]!) |
-	// 			(data[index + 1]! << 8) |
-	// 			(data[index + 2]! << 16) |
-	// 			(data[index + 3]! << 24);
-	//
-	// 		k1 = Math.imul(k1, c1);
-	// 		k1 = (k1 << 15) | (k1 >>> 17);
-	// 		k1 = Math.imul(k1, c2);
-	//
-	// 		h1 ^= k1;
-	// 		h1 = (h1 << 13) | (h1 >>> 19);
-	// 		h1 = Math.imul(h1, 5) + 0xe6546b64;
-	// 	}
-	//
-	// 	// 尾部处理
-	// 	let k2 = 0;
-	// 	const tailIndex = nblocks * 4;
-	// 	const remaining = data.length % 4;
-	//
-	// 	if (remaining >= 3) {
-	// 		k2 ^= data[tailIndex + 2]! << 16;
-	// 	}
-	// 	if (remaining >= 2) {
-	// 		k2 ^= data[tailIndex + 1]! << 8;
-	// 	}
-	// 	if (remaining >= 1) {
-	// 		k2 ^= data[tailIndex]!;
-	// 		k2 = Math.imul(k2, c1);
-	// 		k2 = (k2 << 15) | (k2 >>> 17);
-	// 		k2 = Math.imul(k2, c2);
-	// 		h1 ^= k2;
-	// 	}
-	//
-	// 	// 最终混淆
-	// 	h1 ^= data.length;
-	// 	h1 ^= h1 >>> 16;
-	// 	h1 = Math.imul(h1, 0x85ebca6b);
-	// 	h1 ^= h1 >>> 13;
-	// 	h1 = Math.imul(h1, 0xc2b2ae35);
-	// 	h1 ^= h1 >>> 16;
-	//
-	// 	// 使用 Base36 编码返回
-	// 	return (h1 >>> 0).toString(36);
-	// }
+	/** 
+	 * 提取时即时解混淆，返回的视图必须在使用后立即由调用者 fill(0)
+	 */
+	public get(): Uint8Array {
+		const data = new Uint8Array(this.obfuscatedData.length);
+		for (let i = 0; i < this.obfuscatedData.length; i++) {
+			data[i] = this.obfuscatedData[i]! ^ this.memoryKey[i]!;
+		}
+		return data;
+	}
 
-	// /**
-	//  * 序列化扩展结构：转为 sz=v&k2=v2&cx=HASH 的紧凑且防篡改格式
-	//  */
-	// private stringifyExt(ext: PhantomExtensionData): string {
-	// 	const parts: string[] = [];
-	// 	if (ext.sz !== undefined) parts.push(`sz=${ext.sz.toString(36)}`);
-	//
-	// 	const payload = parts.join('&');
-	// 	if (!payload) return ""; // 空扩展
-	//
-	// 	const cx = this.calculateChecksum(payload);
-	// 	return `${payload}&cx=${cx}`;
-	// }
+	/** 彻底擦除内存 */
+	public clear() {
+		this.memoryKey.fill(0);
+		this.obfuscatedData.fill(0);
+	}
+}
 
-	// /**
-	//  * 反序列化扩展结构：剥离签名进行散列比对，验证失败触发拦截降级
-	//  */
-	// private parseExt(extStr: string): PhantomExtensionData | null {
-	// 	if (!extStr) return {};
-	//
-	// 	// 拆离散列签名区
-	// 	const cxMatch = extStr.match(/&cx=([^&]+)$/);
-	// 	let payload = extStr;
-	// 	let expectedCx = '';
-	//
-	// 	if (cxMatch) {
-	// 		expectedCx = cxMatch[1]!;
-	// 		payload = extStr.substring(0, cxMatch.index);
-	// 	} else {
-	// 		// 找不到签名，意味着数据结构受损或非标准篡改，抛弃元数据
-	// 		return null;
-	// 	}
-	//
-	// 	// 验证内容完整性
-	// 	if (this.calculateChecksum(payload) !== expectedCx) {
-	// 		return null; // 散列不匹配，元数据被污染，触发返回 null 以供上层降级
-	// 	}
-	//
-	// 	const data: PhantomExtensionData = {};
-	// 	const parts = payload.split('&');
-	// 	for (const part of parts) {
-	// 		const [k, v] = part.split('=');
-	// 		if (k === 'sz' && v) {
-	// 			const parsedSize = parseInt(v, 36);
-	// 			if (!isNaN(parsedSize)) data.sz = parsedSize;
-	// 		} else if (k && v) {
-	// 			data[k] = v; // 将未知/未来的扩展字段兜底保存
-	// 		}
-	// 	}
-	// 	return data;
-	// }
-
-	// /**
-	//  * 提取外置的结构化扩展数据
-	//  */
-	// getExtensionData(headerText: string): PhantomExtensionData | null {
-	// 	if (!headerText.startsWith(MAGIC_HEADER)) return null;
-	//
-	// 	const body = headerText.substring(MAGIC_HEADER.length);
-	// 	const colonIndex = body.indexOf(':');
-	//
-	// 	// 只有在存在次级分隔符冒号时，才证明是完全符合结构的新版数据
-	// 	if (colonIndex > -1) {
-	// 		const extStr = body.substring(0, colonIndex);
-	// 		return this.parseExt(extStr);
-	// 	}
-	// 	return null;
-	// }
+class CryptoHelper {
+	/**
+	 * 安全的 Base64 编码机制
+	 */
+	public safeBase64Encode(arr: Uint8Array): string {
+		let result: string;
+		if (arr.byteOffset === 0 && arr.byteLength === arr.buffer.byteLength) {
+			result = arrayBufferToBase64(arr.buffer as ArrayBuffer);
+		} else {
+			const copy = new Uint8Array(arr);
+			result = arrayBufferToBase64(copy.buffer);
+			copy.fill(0); // 销毁防止逃逸的副本
+		}
+		return result;
+	}
 
 	/**
-	 * 获取纯净的 Base64 Payload
-	 * 此处逻辑与元数据提取严格隔离，确保只要冒号后面的载荷完整就能返回，不受元数据损毁影响
+	 * 安全提取纯净的 ArrayBuffer (供 Obsidian 底层 Adapter 使用)
+	 * 此方法只能用于最终向 Obsidian 提交需要落盘的文件数据块（明文或密文结果）
+	 * 绝不允许在处理任何密钥、密码凭证时调用此方法
+	 */
+	public getCleanBuffer(arr: Uint8Array): ArrayBuffer {
+		if (arr.byteOffset === 0 && arr.byteLength === arr.buffer.byteLength) {
+			return arr.buffer as ArrayBuffer;
+		}
+		const result = new ArrayBuffer(arr.byteLength);
+		new Uint8Array(result).set(arr);
+		return result;
+	}
+
+	/**
+	 * 恒定时间比较，防止针对密钥或散列的计时攻击
+	 */
+	public compareBytes(a: Uint8Array, b: Uint8Array): boolean {
+		if (a.length !== b.length) return false;
+		let result = 0;
+		for (let i = 0; i < a.length; i++) result |= a[i]! ^ b[i]!;
+		return result === 0;
+	}
+
+
+	/**
+	 * MurmurHash3 32-bit 实现
+	 * 优于 FNV-1a，具有更好的雪崩效应和更低的碰撞率
+	 */
+	public calculateChecksum(input: string | Uint8Array, seed: number = 0x12345678): string {
+		const data = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+
+		// 拦截 0 字节内容，给定独立标识
+		if (data.length === 0) return "empty_hash";
+
+		const nblocks = Math.floor(data.length / 4);
+		let h1 = seed;
+
+		const c1 = 0xcc9e2d51;
+		const c2 = 0x1b873593;
+
+		// 块处理 (每 4 字节一组)
+		for (let i = 0; i < nblocks; i++) {
+			const index = i * 4;
+			// 模拟小端序读取 32 位整数
+			let k1 = (data[index]! & 0xff) |
+				((data[index + 1]! & 0xff) << 8) |
+				((data[index + 2]! & 0xff) << 16) |
+				((data[index + 3]! & 0xff) << 24);
+
+			k1 = Math.imul(k1, c1);
+			k1 = (k1 << 15) | (k1 >>> 17);
+			k1 = Math.imul(k1, c2);
+
+			h1 ^= k1;
+			h1 = (h1 << 13) | (h1 >>> 19);
+			h1 = Math.imul(h1, 5) + 0xe6546b64;
+		}
+
+		// 尾部处理
+		let k2 = 0;
+		const tailIndex = nblocks * 4;
+		const remaining = data.length % 4;
+
+		if (remaining >= 3) {
+			k2 ^= (data[tailIndex + 2]! & 0xff) << 16;
+		}
+		if (remaining >= 2) {
+			k2 ^= (data[tailIndex + 1]! & 0xff) << 8;
+		}
+		if (remaining >= 1) {
+			k2 ^= (data[tailIndex]! & 0xff);
+			k2 = Math.imul(k2, c1);
+			k2 = (k2 << 15) | (k2 >>> 17);
+			k2 = Math.imul(k2, c2);
+			h1 ^= k2;
+		}
+
+		// 最终混淆
+		h1 ^= data.length;
+		h1 ^= h1 >>> 16;
+		h1 = Math.imul(h1, 0x85ebca6b);
+		h1 ^= h1 >>> 13;
+		h1 = Math.imul(h1, 0xc2b2ae35);
+		h1 ^= h1 >>> 16;
+
+		// 使用 Base36 编码返回
+		return (h1 >>> 0).toString(36);
+	}
+
+	/**
+	 * 序列化扩展结构：转为 sz=v&kid=v&ek=v 的紧凑且防篡改格式
+	 */
+	private stringifyExt(ext: PhantomExtensionData): string {
+		const parts: string[] = [];
+		if (ext.sz !== undefined) parts.push(`sz=${ext.sz.toString(36)}`);
+		if (ext.ph !== undefined) parts.push(`ph=${ext.ph}`);
+		if (ext.cp !== undefined) parts.push(`cp=${ext.cp}`);
+		if (ext.kid !== undefined) parts.push(`kid=${ext.kid}`);
+		if (ext.ek !== undefined) parts.push(`ek=${ext.ek}`);
+		if (ext.bf !== undefined) parts.push(`bf=${ext.bf}`);
+
+		const payload = parts.join('&');
+		if (!payload) return ""; // 空扩展
+
+		const cx = this.calculateChecksum(payload);
+		return `${payload}&cx=${cx}`;
+	}
+
+	/**
+	 * 反序列化扩展结构：剥离签名进行散列比对，验证失败触发拦截降级
+	 */
+	private parseExt(extStr: string): PhantomExtensionData {
+		const data: PhantomExtensionData = {};
+		if (!extStr) return data;
+
+		// 分解键值对，不再在解析阶段验证 CX
+		const parts = extStr.split('&');
+		for (const part of parts) {
+			const idx = part.indexOf('=');
+			if (idx > 0) {
+				const k = part.substring(0, idx);
+				const v = part.substring(idx + 1);
+				if (k === 'sz') { const p = parseInt(v, 36); if (!isNaN(p)) data.sz = p; }
+				else if (k === 'cp') { const p = parseInt(v, 10); if (!isNaN(p)) data.cp = p; }
+				else if (k === 'bf') { const p = parseInt(v, 10); if (!isNaN(p)) data.bf = p; }
+				else if (k === 'ph') { data.ph = v; }
+				else if (k === 'kid') { data.kid = v; }
+				else if (k === 'ek') { data.ek = v; }
+				else if (k === 'cx') { data.cx = v; } // 将 cx 作为一个普通字段提取
+				else { data[k] = v; } // 将未知/未来的扩展字段兜底保存
+			}
+		}
+		return data;
+	}
+
+	/**
+	 * 提取外置的结构化扩展数据
+	 */
+	public getExtensionData(headerText: string): PhantomExtensionData | null {
+		if (!headerText.startsWith(MAGIC_HEADER)) return null;
+
+		const body = headerText.substring(MAGIC_HEADER.length);
+		const colonIndex = body.indexOf(':');
+
+		if (colonIndex > -1) {
+			const extStr = body.substring(0, colonIndex);
+			const data = this.parseExt(extStr);
+
+			// 校验元数据块的完整性
+			const cxMatch = extStr.match(/&cx=([^&]+)$/);
+			if (cxMatch) {
+				const expectedCx = cxMatch[1];
+				const payload = extStr.substring(0, cxMatch.index);
+				// 记录验证状态，但不拦截。如果 cx 匹配，则 metadata 为真
+				data._isValid = this.calculateChecksum(payload) === expectedCx;
+			} else {
+				data._isValid = false;
+			}
+			return data;
+		}
+		return null;
+	}
+
+	/**
+	 * 获取纯净的 Base64 Payload (仅限文本文件)
 	 */
 	private getBase64Payload(armoredText: string): string | null {
 		const body = armoredText.substring(MAGIC_HEADER.length);
 		const colonIndex = body.indexOf(':');
 
-		// 冒号后方即为密文载荷，支持形如 ENC_V1::Payload (空扩展段) 的情况
+		// 冒号后方即为密文载荷
 		if (colonIndex > -1) {
 			return body.substring(colonIndex + 1);
 		}
@@ -247,120 +338,266 @@ class CryptoHelper {
 	 * 压缩逻辑：使用原生 CompressionStream 对数据进行 deflate 压缩
 	 */
 	private async compress(data: Uint8Array): Promise<Uint8Array> {
-		const cleanBuffer = this.toBuffer(data);
-		const stream = new Blob([cleanBuffer]).stream().pipeThrough(new CompressionStream('deflate'));
-		return new Uint8Array(await new Response(stream).arrayBuffer());
+		if (data.byteLength === 0) return data;
+		const stream = new Blob([data as unknown as BlobPart]).stream().pipeThrough(new CompressionStream('deflate'));
+		const buffer = await new Response(stream).arrayBuffer();
+		return new Uint8Array(buffer);
 	}
 
 	/**
 	 * 解压逻辑：使用原生 DecompressionStream 还原数据
 	 */
 	private async decompress(data: Uint8Array): Promise<Uint8Array> {
-		const cleanBuffer = this.toBuffer(data);
-		const stream = new Blob([cleanBuffer]).stream().pipeThrough(new DecompressionStream('deflate'));
-		return new Uint8Array(await new Response(stream).arrayBuffer());
+		if (data.byteLength === 0) return data;
+		const stream = new Blob([data as unknown as BlobPart]).stream().pipeThrough(new DecompressionStream('deflate'));
+		const buffer = await new Response(stream).arrayBuffer();
+		return new Uint8Array(buffer);
 	}
 
-	/**
-	 * 派生密钥：利用 Argon2id 派生计算 256 位密钥
-	 * 包含缓存机制，避免同一盐值重复计算
-	 */
-	async getEffectiveKey(passwordBytes: Uint8Array, saltArr: Uint8Array): Promise<CryptoKey> {
-		const saltKey = arrayBufferToBase64(this.toBuffer(saltArr));
-		if (this.keyMapCache.has(saltKey)) return this.keyMapCache.get(saltKey)!;
+	/** WebCrypto API 凭证包装 */
+	async importGCMKey(raw: Uint8Array): Promise<CryptoKey> {
+		return await crypto.subtle.importKey("raw", raw as unknown as BufferSource, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+	}
 
-		// 队列化派生请求
-		if (this.derivationPromise) return await this.derivationPromise;
-
-		this.derivationPromise = (async () => {
-			const result = await argon2id({
-				password: passwordBytes, salt: saltArr, iterations: 3, memorySize: 65536, parallelism: 4, hashLength: 32, outputType: 'binary'
-			});
-			const derivedKey = await crypto.subtle.importKey("raw", this.toBuffer(result), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
-			this.keyMapCache.set(saltKey, derivedKey);
-
-			// 派生完成后立刻抹零
-			result.fill(0);
-			return derivedKey;
-		})();
-
+	/** 派生主密钥 (KEK) - 仅在设置密码时调度 */
+	async deriveKEK(password: string): Promise<Uint8Array> {
+		const pwdBytes = new TextEncoder().encode(password);
 		try {
-			return await this.derivationPromise;
+			const raw = await argon2id({
+				password: pwdBytes, salt: KEK_SALT, iterations: 3, memorySize: 65536, parallelism: 4, hashLength: 32, outputType: 'binary'
+			});
+			return raw;
 		} finally {
-			this.derivationPromise = null;
+			pwdBytes.fill(0);
+		}
+	}
+
+	/** 加密数据密钥 -> 生成 EDEK */
+	async encryptDEK(dekRaw: Uint8Array, kek: CryptoKey): Promise<string> {
+		const iv = crypto.getRandomValues(new Uint8Array(IV_SIZE));
+		const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, kek, dekRaw as unknown as BufferSource);
+		const combined = new Uint8Array(IV_SIZE + cipher.byteLength);
+		combined.set(iv, 0);
+		combined.set(new Uint8Array(cipher), IV_SIZE);
+		// 安全转换为 Base64
+		return this.safeBase64Encode(combined);
+	}
+
+	/** 解密 EDEK -> 还原底层数据密钥 DEK */
+	async decryptDEK(edekStr: string, kek: CryptoKey): Promise<Uint8Array | null> {
+		try {
+			const combined = new Uint8Array(base64ToArrayBuffer(edekStr));
+			if (combined.length < IV_SIZE) return null;
+			const iv = combined.subarray(0, IV_SIZE);
+			const cipher = combined.subarray(IV_SIZE);
+			const dekRaw = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, kek, cipher);
+			return new Uint8Array(dekRaw);
+		} catch (_e) {
+			void _e;
+			return null;
 		}
 	}
 
 	/**
-	 * 加密执行逻辑：处理压缩 -> 加密 -> 组合完整的带元数据的加装体
+	 * 加密执行逻辑：压缩 -> DEK加密 -> 组合完整的带 KID 的元数据体
 	 */
-	async encrypt(data: Uint8Array, passwordBytes: Uint8Array, shouldCompress: boolean): Promise<string> {
+	async encryptFile(data: Uint8Array, dek: CryptoKey, edekStr: string, kid: string, shouldCompress: boolean, asBinary: boolean = false): Promise<string | Uint8Array> {
 		let payload = data;
 		let compressionFlag = 0;
+		let isPayloadCompressed = false;
 
 		// 扩展名允许且数据大小超过阈值进行压缩
 		if (shouldCompress && data.byteLength > COMPRESSION_THRESHOLD) {
 			try {
 				payload = await this.compress(data);
 				compressionFlag = 1;
-			} catch {
+				isPayloadCompressed = true;
+			} catch (_e) {
+				void _e;
 				// 如果压缩失败，降级回不压缩模式，确保数据不丢失
 				payload = data;
 				compressionFlag = 0;
 			}
 		}
-		// 运行时保持盐值一致，确保同一密码下的所有文件共用一个 CryptoKey 缓存
-		if (!this.sessionSalt) {
-			this.sessionSalt = crypto.getRandomValues(new Uint8Array(SALT_SIZE));
+
+		// 生成原始明文的校验和，用于在转换时保证内容一致
+		const ph = this.calculateChecksum(data);
+
+		// 计算精确的总切割数，若空白则强制分出1个空片用于产出 Tag 签名
+		const numChunks = Math.max(1, Math.ceil(payload.byteLength / CHUNK_SIZE));
+		const totalCipherLength = payload.byteLength + numChunks * (IV_SIZE + TAG_SIZE);
+
+		let finalPayload: Uint8Array | null = null;
+		let base64Combined: Uint8Array | null = null;
+		let writeBuffer: Uint8Array;
+		let writeOffsetBase = 0;
+		let headerStr = "";
+
+		if (asBinary) {
+			const extBlock = this.stringifyExt({ sz: data.byteLength, ph: ph, ek: edekStr, cp: compressionFlag, kid: kid, bf: 1 });
+			headerStr = MAGIC_HEADER + extBlock + ":";
+			const headerBytes = new TextEncoder().encode(headerStr);
+
+			finalPayload = new Uint8Array(headerBytes.length + totalCipherLength);
+			finalPayload.set(headerBytes, 0);
+
+			writeBuffer = finalPayload;
+			writeOffsetBase = headerBytes.length;
+		} else {
+			const extBlock = this.stringifyExt({ sz: data.byteLength, ph: ph, ek: edekStr, cp: compressionFlag, kid: kid });
+			headerStr = MAGIC_HEADER + extBlock + ":";
+
+			base64Combined = new Uint8Array(totalCipherLength);
+			writeBuffer = base64Combined;
+			writeOffsetBase = 0;
 		}
-		const salt = this.sessionSalt;
-		const iv = crypto.getRandomValues(new Uint8Array(IV_SIZE));
-		const key = await this.getEffectiveKey(passwordBytes, salt);
-		const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: this.toBuffer(iv) }, key, this.toBuffer(payload));
 
-		// 存储结构：Salt(16) + IV(12) + CompressionFlag(1) + Ciphertext(n)
-		const combined = new Uint8Array(SALT_SIZE + IV_SIZE + 1 + ciphertext.byteLength);
-		combined.set(salt, 0);
-		combined.set(iv, SALT_SIZE);
-		combined.set([compressionFlag], SALT_SIZE + IV_SIZE);
-		combined.set(new Uint8Array(ciphertext), SALT_SIZE + IV_SIZE + 1);
+		// 分块加密
+		for (let i = 0; i < numChunks; i++) {
+			const start = i * CHUNK_SIZE;
+			const chunk = payload.subarray(start, start + CHUNK_SIZE);
+			const targetOffset = writeOffsetBase + i * (CHUNK_SIZE + IV_SIZE + TAG_SIZE);
 
-		// 精简后的结构直接为 ENC_V1::Payload，跳过 ExtBlock 处理
-		// const extData: PhantomExtensionData = { sz: data.byteLength };
-		// const extBlock = this.stringifyExt(extData);
-		// return MAGIC_HEADER + extBlock + ":" + arrayBufferToBase64(this.toBuffer(combined));
+			const iv = crypto.getRandomValues(new Uint8Array(IV_SIZE));
+			const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, dek, chunk as unknown as BufferSource);
 
-		return MAGIC_HEADER + ":" + arrayBufferToBase64(this.toBuffer(combined));
+			writeBuffer.set(iv, targetOffset);
+			writeBuffer.set(new Uint8Array(cipherBuf), targetOffset + IV_SIZE);
+
+			// 每处理 16 个分块 (约 64MB)，强制使用 setTimeout 让出主线程
+			if (i > 0 && i % 16 === 0) {
+				await new Promise(r => window.setTimeout(r, 0));
+			}
+		}
+
+		if (isPayloadCompressed && payload instanceof Uint8Array) {
+			payload.fill(0);
+		}
+
+		if (asBinary) return writeBuffer;
+		return headerStr + this.safeBase64Encode(writeBuffer);
 	}
-
 	/**
-	 * 解密执行逻辑：拆包提取基础 Base64 -> 解密 -> 处理解压
+	 * 解密执行逻辑：KID识别 -> DEK解密 -> 回退解密 -> 解压
 	 */
-	async decrypt(armoredText: string, passwordBytes: Uint8Array): Promise<Uint8Array | null> {
-		if (!this.isEncrypted(armoredText)) return null;
+	async decryptFile(armoredData: string | Uint8Array, currentDek: CryptoKey | null, currentKek: CryptoKey | null, currentKid: string | null): Promise<{ data: Uint8Array, usedFallback: boolean, ph?: string } | null> {
 
-		// 解密获取 Payload 时自动隔离元数据区
-		// 因此即使元数据因为外部篡改受损，只要后面的 Base64 完好，解密就不会崩溃
-		const base64Payload = this.getBase64Payload(armoredText);
-		if (!base64Payload) return null; // 完全找不到载荷分隔符才判定格式报废
+		let combined: Uint8Array;
+		let extData: PhantomExtensionData | null = null;
 
-		const combined = new Uint8Array(base64ToArrayBuffer(base64Payload));
-		if (combined.length < SALT_SIZE + IV_SIZE + 1) return null;
+		if (typeof armoredData === 'string') {
+			if (armoredData.startsWith(MAGIC_HEADER_V1)) throw new Error("UNSUPPORTED_V1");
+			if (!this.isEncrypted(armoredData)) return null;
 
-		const salt = combined.subarray(0, SALT_SIZE);
-		const iv = combined.subarray(SALT_SIZE, SALT_SIZE + IV_SIZE);
-		const compressionFlag = combined[SALT_SIZE + IV_SIZE];
-		const ciphertext = combined.subarray(SALT_SIZE + IV_SIZE + 1);
+			extData = this.getExtensionData(armoredData);
+			if (extData?.bf === 1) {
+				throw new Error("ERR_BINARY_READ_AS_TEXT");
+			}
 
-		const key = await this.getEffectiveKey(passwordBytes, salt);
-		try {
-			const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: this.toBuffer(iv) }, key, this.toBuffer(ciphertext));
-			let finalData: Uint8Array = new Uint8Array(decrypted);
-			if (compressionFlag === 1) finalData = await this.decompress(finalData);
-			return finalData;
-		} catch {
-			return null; // 载荷自身 GCM 校验失败才会返回 null
+			const base64Payload = this.getBase64Payload(armoredData);
+			if (!base64Payload) return null;
+
+			combined = new Uint8Array(base64ToArrayBuffer(base64Payload));
+		} else {
+			let headerEndIndex = -1;
+			for (let i = MAGIC_HEADER.length; i < Math.min(armoredData.length, 2048); i++) {
+				if (armoredData[i] === 58) {
+					headerEndIndex = i;
+					break;
+				}
+			}
+			if (headerEndIndex === -1) return null;
+
+			const headerBytes = armoredData.subarray(0, headerEndIndex);
+			const headerStr = new TextDecoder().decode(headerBytes);
+			if (headerStr.startsWith(MAGIC_HEADER_V1)) throw new Error("UNSUPPORTED_V1");
+
+			extData = this.getExtensionData(headerStr + ":");
+			if (extData?.bf === 1) {
+				combined = armoredData.subarray(headerEndIndex + 1);
+			} else {
+				const b64Bytes = armoredData.subarray(headerEndIndex + 1);
+				const b64Str = new TextDecoder().decode(b64Bytes);
+				combined = new Uint8Array(base64ToArrayBuffer(b64Str.trim()));
+			}
 		}
+
+		if (combined.length < IV_SIZE) return null;
+
+		const compressionFlag = extData?.cp || 0;
+
+		// 无论 cx 校验是否通过，只要解析出了 KID 且不匹配，立即抛出 KID 错误
+		if (extData?.kid && currentKid && extData.kid !== currentKid) {
+			throw new Error(`KID_MISMATCH:${extData.kid}`);
+		}
+
+		// 分块解密
+		const attemptDecryption = async (dek: CryptoKey): Promise<Uint8Array> => {
+			const numChunks = Math.max(1, Math.ceil(combined.byteLength / (CHUNK_SIZE + IV_SIZE + TAG_SIZE)));
+			const plainTotalLength = combined.byteLength - (numChunks * (IV_SIZE + TAG_SIZE));
+			const resultBuffer = new Uint8Array(plainTotalLength);
+
+			for (let i = 0; i < numChunks; i++) {
+				const cipherOffset = i * (CHUNK_SIZE + IV_SIZE + TAG_SIZE);
+				const plainOffset = i * CHUNK_SIZE;
+				const currentChunkSize = Math.min(combined.byteLength - cipherOffset, CHUNK_SIZE + IV_SIZE + TAG_SIZE);
+
+				const iv = combined.subarray(cipherOffset, cipherOffset + IV_SIZE);
+				const ciphertext = combined.subarray(cipherOffset + IV_SIZE, cipherOffset + currentChunkSize);
+
+				const decChunk = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv as unknown as BufferSource }, dek, ciphertext as unknown as BufferSource);
+				const decArray = new Uint8Array(decChunk);
+				resultBuffer.set(decArray, plainOffset);
+
+				// 每处理 16 个分块 (约 64MB)，强制使用 setTimeout 让出主线程
+				if (i > 0 && i % 16 === 0) {
+					await new Promise(r => window.setTimeout(r, 0));
+				}
+			}
+			return resultBuffer;
+		};
+
+		let finalPlaintext: Uint8Array | null = null;
+		let usedFallback = false;
+
+		// 路径 A: 尝试使用当前库的 DEK 解密
+		if (currentDek) {
+			try {
+				finalPlaintext = await attemptDecryption(currentDek);
+			} catch (_e) {
+				void _e; // 失败说明库 DEK 可能已变更，进入自愈路径
+			}
+		}
+
+		// 路径 B: 库 DEK 不通时，尝试用主 KEK 解开文件自带的 EDEK
+		if (!finalPlaintext && currentKek && extData?.ek) {
+			const fallbackDekRaw = await this.decryptDEK(extData.ek, currentKek);
+			if (fallbackDekRaw) {
+				try {
+					const fallbackDek = await this.importGCMKey(fallbackDekRaw);
+					finalPlaintext = await attemptDecryption(fallbackDek);
+					usedFallback = true;
+				} catch (_e) {
+					void _e;
+				} finally {
+					fallbackDekRaw.fill(0);
+				}
+			}
+		}
+
+		if (!finalPlaintext) throw new Error(i18n.t('ERR_DECRYPT_FAIL'));
+
+		if (compressionFlag === 1) {
+			const compressedBuffer = finalPlaintext; // 暂存压缩态明文
+			try {
+				finalPlaintext = await this.decompress(compressedBuffer);
+			} finally {
+				// 在获得解压数据后，立即物理擦除掉旧的压缩态明文
+				compressedBuffer.fill(0);
+			}
+		}
+
+		return { data: finalPlaintext, usedFallback, ph: extData?.ph };
 	}
 
 	/**
@@ -368,8 +605,13 @@ class CryptoHelper {
 	 */
 	isEncrypted(data: string | ArrayBuffer | Uint8Array | null): boolean {
 		if (!data) return false;
-		if (typeof data === 'string') return data.startsWith(MAGIC_HEADER);
 
+		// 字符串特征检测
+		if (typeof data === 'string') {
+			return data.startsWith(MAGIC_HEADER) || data.startsWith(MAGIC_HEADER_V1);
+		}
+
+		// 二进制特征检测
 		let bytes: Uint8Array;
 		if (data instanceof Uint8Array) {
 			bytes = data;
@@ -377,19 +619,16 @@ class CryptoHelper {
 			bytes = new Uint8Array(data);
 		}
 
+		// 长度不足以包含特征头
 		if (bytes.length < MAGIC_HEADER.length) return false;
 
+		// 提取前 7 位字符进行比对
 		let header = "";
-		for (let i = 0; i < MAGIC_HEADER.length; i++) header += String.fromCharCode(bytes[i]!);
-		return header === MAGIC_HEADER;
-	}
-
-	clearCache() {
-		this.keyMapCache.clear();
-		if (this.sessionSalt) {
-			this.sessionSalt.fill(0); // 盐值清除时同步擦除内存
-			this.sessionSalt = null;
+		for (let i = 0; i < MAGIC_HEADER.length; i++) {
+			header += String.fromCharCode(bytes[i]!);
 		}
+
+		return header === MAGIC_HEADER || header === MAGIC_HEADER_V1;
 	}
 }
 
@@ -397,9 +636,12 @@ export default class PhantomCipherPlugin extends Plugin {
 	settings!: PhantomCipherSettings;
 	crypto: CryptoHelper = new CryptoHelper();
 
-	// 内存混淆安全凭证
-	private memoryKey: Uint8Array | null = null;
-	private obfuscatedPassword: Uint8Array | null = null;
+	// 内存混淆安全凭证 (保护驻留的 KEK 与 DEK 原始字节流)
+	private secureKEK: SecureKey | null = null;
+	private secureDEK: SecureKey | null = null;
+
+	public vaultEDEK: string | null = null; // 供高频写入拼接使用
+	public vaultKID: string | null = null; // 截取自 KEK 的前 6 位用于快速识别
 
 	private originalRead!: (path: string) => Promise<string>;
 	private originalWrite!: (path: string, data: string, options?: DataWriteOptions) => Promise<void>;
@@ -417,114 +659,106 @@ export default class PhantomCipherPlugin extends Plugin {
 	private errorThrottler: Map<string, number> = new Map();
 
 	private decryptedPaths: Set<string> = new Set(); // 追踪真正解密成功的路径
-	private blobUrlCache: Map<string, string> = new Map(); // 缓存已解密文件的 Blob URL，确保编辑器和媒体加载正常
+	private blobUrlCache: Map<string, string> = new Map(); // 缓存已解密文件的 Blob URL
+	private blobMtimeCache: Map<string, number> = new Map(); // 资源生命周期管理：通过 mtime 锚定 Blob 状态
+
+	// 记录 app:// 内部路径与原始物理 vault 路径的反向映射供 PDF 拦截器使用
+	private resourcePathToVaultPath: Map<string, string> = new Map();
 
 	private visibilityTimeout: number | null = null; // 后台清理定时器引用
 
-	/**
-	 * 设置密码时，立刻使用随机数进行 XOR 混淆存储
-	 */
-	private setPassword(pwd: string | null) {
-		// 先擦除旧密码内存
-		if (this.obfuscatedPassword) this.obfuscatedPassword.fill(0);
-		if (this.memoryKey) this.memoryKey.fill(0);
-
-		if (!pwd) {
-			this.memoryKey = null;
-			this.obfuscatedPassword = null;
-			return;
-		}
-
-		const pwdBytes = new TextEncoder().encode(pwd);
-		const memKey = crypto.getRandomValues(new Uint8Array(pwdBytes.length));
-		const obfPwd = new Uint8Array(pwdBytes.length);
-
-		for (let i = 0; i < pwdBytes.length; i++) {
-			obfPwd[i] = pwdBytes[i]! ^ memKey[i]!;
-		}
-
-		this.memoryKey = memKey;
-		this.obfuscatedPassword = obfPwd;
-		// 敏感数据用完立刻清零
-		pwdBytes.fill(0);
+	/** 判断当前设备是否已装载混淆容器 */
+	public hasPassword(): boolean {
+		return this.secureKEK !== null;
 	}
 
-	/**
-	 * 判断当前是否存在主密码缓存
+	/** 
+	 * 临时提取密钥：
+	 * 1. 从 XOR 容器提取字节 -> 2. 导入 CryptoKey -> 3. 立即物理擦除解混淆的字节 
 	 */
-	private hasPassword(): boolean {
-		return this.memoryKey !== null && this.obfuscatedPassword !== null;
+	private async getTmpKEK(): Promise<CryptoKey | null> {
+		if (!this.secureKEK) return null;
+		const raw = this.secureKEK.get();
+		try { return await this.crypto.importGCMKey(raw); }
+		finally { raw.fill(0); }
 	}
 
-	/**
-	 * 获取密码时即时还原
-	 */
-	private async withPassword<T>(callback: (pwd: Uint8Array) => Promise<T>): Promise<T | null> {
-		const memKey = this.memoryKey;
-		const obfPwd = this.obfuscatedPassword;
-
-		if (!memKey || !obfPwd) return null;
-
-		const pwdBytes = new Uint8Array(obfPwd.length);
-		for (let i = 0; i < obfPwd.length; i++) {
-			pwdBytes[i] = obfPwd[i]! ^ memKey[i]!;
-		}
-
-		try {
-			return await callback(pwdBytes);
-		} finally {
-			// 主动清理明文密码所在的临时字节数组
-			pwdBytes.fill(0);
-		}
+	private async getTmpDEK(): Promise<CryptoKey | null> {
+		if (!this.secureDEK) return null;
+		const raw = this.secureDEK.get();
+		try { return await this.crypto.importGCMKey(raw); }
+		finally { raw.fill(0); }
 	}
 
-	/**
-	 * 密钥缺失提示（针对未设置密码的情况）
-	 */
+	/** 密钥缺失提示 */
 	private notifyPasswordMissing() {
 		const now = Date.now();
 		const lastTime = this.errorThrottler.get("__PWD_MISSING") || 0;
-		if (now - lastTime > 5000) { // 5 秒只提醒一次
-			new Notice(i18n.t('NOTICE_SET_PASSWORD'));
+		if (now - lastTime > 5000) {
+			new Notice(i18n.t('ERR_PWD_MISSING'));
 			this.errorThrottler.set("__PWD_MISSING", now);
 		}
 	}
 
-	/**
-	 * 解密失败提示（针对密码错误或损坏的情况）
-	 */
-	private notifyDecryptFailed(path: string) {
-		const fileName = path.split('/').pop() || path;
+	/** KID 不匹配提示 */
+	private notifyKidMismatch(path: string, kid: string) {
+		const name = path.split('/').pop() || path;
 		const now = Date.now();
-		const lastTime = this.errorThrottler.get("__DECRYPT_FAIL_" + path) || 0;
-		if (now - lastTime > 5000) {
-			new Notice(i18n.t('ERROR_DECRYPT', { name: fileName }));
-			this.errorThrottler.set("__DECRYPT_FAIL_" + path, now);
+		const throttleKey = "__KID_FAIL_" + path;
+		if (now - (this.errorThrottler.get(throttleKey) || 0) > 5000) {
+			new Notice(i18n.t('ERR_KID_MISMATCH', { name, kid }));
+			this.errorThrottler.set(throttleKey, now);
+		}
+	}
+
+	/** 损坏或底层解密失败提示 */
+	private notifyDecryptFailed(path: string) {
+		const name = path.split('/').pop() || path;
+		const now = Date.now();
+		const throttleKey = "__DECRYPT_FAIL_" + path;
+		if (now - (this.errorThrottler.get(throttleKey) || 0) > 5000) {
+			new Notice(i18n.t('ERR_DECRYPT', { name }));
+			this.errorThrottler.set(throttleKey, now);
 		}
 	}
 
 	/**
-	 * 视口失焦事件处理器。负责在挂起到后台且闲置 10 分钟后主动擦除驻留的派生密钥
+	 * V1 降级提醒
+	 */
+	private notifyV1Unsupported() {
+		const now = Date.now();
+		const lastTime = this.errorThrottler.get("__V1_WARN") || 0;
+		if (now - lastTime > 10000) { // 10秒防抖区间
+			new Notice("UNSUPPORTED_V1: Legacy ENC_V1 format detected. Decryption is no longer supported in V2. Please downgrade to v1.0.8 to decrypt and migrate your files.");
+			this.errorThrottler.set("__V1_WARN", now);
+		}
+	}
+
+	/**
+	 * 视口失焦事件处理器。负责在挂起到后台且闲置 10 分钟后主动擦除驻留的密钥对象
 	 */
 	private onVisibilityChange = () => {
 		if (activeDocument.hidden) {
 			this.visibilityTimeout = window.setTimeout(() => {
-				this.crypto.clearCache(); // 清除派生凭据
-			}, 10 * 60 * 1000); // 10 minutes
-		} else {
+				// 擦除内存中的所有加密原材料
+				if (this.secureKEK) { this.secureKEK.clear(); this.secureKEK = null; }
+				if (this.secureDEK) { this.secureDEK.clear(); this.secureDEK = null; }
+			}, 10 * 60 * 1000);
 			if (this.visibilityTimeout !== null) {
 				window.clearTimeout(this.visibilityTimeout);
 				this.visibilityTimeout = null;
+			}
+			// 重新回到前台时，尝试从 SecretStorage 重新验证与加载
+			if (!this.secureKEK) {
+				void this.fetchKeys();
 			}
 		}
 	};
 
 	/**
-	 * 当密码重置或者生命周期更迭时，必须立即无差别摧毁之前密码派生出的所有成果。
-	 * 避免由于更换密码导致的旧图像/文本在内存中持续暴露。
+	 * 更换密码/彻底擦除时的强制内清理
 	 */
 	public clearInternalState() {
-		this.crypto.clearCache();
 		this.decryptedPaths.clear();
 
 		// 显式回收掉浏览器缓存的内存 Blob 映射
@@ -577,6 +811,8 @@ export default class PhantomCipherPlugin extends Plugin {
 		this.originalVaultCachedRead = vault.cachedRead.bind(vault);
 
 		this.hookAdapter();
+		
+		this.hookPDFViewer(); // 启动挂载针对 PDF 渲染器原生的底层加载劫持拦截器
 		this.addSettingTab(new CryptoSettingTab(this.app, this));
 
 		// 监听文件打开、修改、以及元数据更新（处理启动时的索引延迟）
@@ -590,12 +826,11 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		this.registerDomEvent(activeDocument, 'visibilitychange', this.onVisibilityChange);
 		this.registerEvent(this.app.workspace.on('window-open', (workspaceWindow) => {
-			// 为新弹出的每一个独立笔记窗口绑定安全焦点追踪
 			this.registerDomEvent(workspaceWindow.doc, 'visibilitychange', this.onVisibilityChange);
 		}));
 
 		this.app.workspace.onLayoutReady(() => {
-			void this.fetchPassword().then(() => {
+			void this.fetchKeys().then(() => {
 				// 延迟 500ms 待视图稳定后执行初次预热
 				window.setTimeout(() => {
 					const activeFile = this.app.workspace.getActiveFile();
@@ -621,31 +856,55 @@ export default class PhantomCipherPlugin extends Plugin {
 		vault.readBinary = this.originalVaultReadBinary;
 		vault.cachedRead = this.originalVaultCachedRead;
 
-		// 取代原本单独清理内存的代码，统一使用强制清理逻辑
 		this.clearInternalState();
 
 		if (this.visibilityTimeout !== null) window.clearTimeout(this.visibilityTimeout);
 
-		this.setPassword(null); // 显式擦除混淆内存
+		// 彻底摧毁混淆内存
+		if (this.secureKEK) { this.secureKEK.clear(); this.secureKEK = null; }
+		if (this.secureDEK) { this.secureDEK.clear(); this.secureDEK = null; }
+		this.vaultEDEK = null; this.vaultKID = null;
 	}
 
 	/**
-	 * 从钥匙串中加载主密码
+	 * 从钥匙串中加载 KEK 与 EDEK
 	 */
-	async fetchPassword() {
+	async fetchKeys() {
+		this.clearInternalState();
 		const storage = this.app.secretStorage;
 		if (!storage) return;
+		const kekB64 = storage.getSecret(this.settings.kekId);
+		const edekB64 = storage.getSecret(this.settings.dekId);
 
-		const raw = storage.getSecret(this.settings.secretName);
+		if (kekB64) {
+			// KID：用于对外宣称的唯一标识
+			this.vaultKID = kekB64.substring(0, 6);
 
-		// 密码重置或获取时，立刻清洗缓存
-		this.clearInternalState();
+			// 临时解密 DEK 存入 XOR
+			const kekRaw = new Uint8Array(base64ToArrayBuffer(kekB64));
+			try {
+				this.secureKEK = new SecureKey(kekRaw);
+				const tKek = await this.crypto.importGCMKey(kekRaw);
 
-		if (raw) {
-			this.setPassword(raw); // 使用混淆存储
-			void this.updateStatusBar(this.app.workspace.getActiveFile());
+				if (edekB64) {
+					this.vaultEDEK = edekB64;
+					const dekRaw = await this.crypto.decryptDEK(edekB64, tKek);
+					if (dekRaw) {
+						try {
+							this.secureDEK = new SecureKey(dekRaw);
+						} finally {
+							dekRaw.fill(0); // 确保临时解出的 DEK 原始字节被立即擦除
+						}
+					}
+				}
+			} finally {
+				// 无论初始化过程是否报错，kekRaw 必须在逻辑跳出前被物理摧毁。
+				kekRaw.fill(0);
+			}
 		} else {
-			this.setPassword(null);
+			if (this.secureKEK) this.secureKEK.clear(); this.secureKEK = null;
+			if (this.secureDEK) this.secureDEK.clear(); this.secureDEK = null;
+			this.vaultEDEK = null; this.vaultKID = null;
 		}
 	}
 
@@ -669,18 +928,118 @@ export default class PhantomCipherPlugin extends Plugin {
 	/**
 	 * LRU 缓存管理
 	 */
-	private addToBlobCache(path: string, url: string) {
+	private addToBlobCache(path: string, url: string, mtime: number) {
+		// 检查路径是否存在，如果存在且 mtime 没变，直接返回
+		if (this.blobUrlCache.has(path) && this.blobMtimeCache.get(path) === mtime) return;
+
+		// 只有在文件确实修改过的情况下，才执行 Revoke
 		if (this.blobUrlCache.has(path)) {
 			URL.revokeObjectURL(this.blobUrlCache.get(path)!);
 			this.blobUrlCache.delete(path);
 		}
+
 		this.blobUrlCache.set(path, url);
+		this.blobMtimeCache.set(path, mtime);
 
 		if (this.blobUrlCache.size > BLOB_CACHE_LIMIT) {
 			for (const [oldPath, oldUrl] of this.blobUrlCache) {
 				URL.revokeObjectURL(oldUrl);
 				this.blobUrlCache.delete(oldPath);
-				break; // Map 迭代严格保证插入顺序，直接 break 以准确淘汰最老的条目
+				this.blobMtimeCache.delete(oldPath);
+				if (this.blobUrlCache.size <= BLOB_CACHE_LIMIT)
+					break; // Map 迭代严格保证插入顺序，直接 break 以准确淘汰最老的条目
+			}
+		}
+	}
+
+	/**
+	 * PDF 渲染器原生劫持处理
+	 * 处理在初次打开或刷新时因为异步的 `blobUrlCache` 处于未挂载状态，导致 PDF.js 退回到默认原生的 app:// 请求
+	 * 从而绕过安全底层钩子抓取到加密明文数据引发的 Invalid PDF structure 报错崩溃死机不刷新问题。
+	 */
+	private hookPDFViewer() {
+		const hookApp = (app: ObsidianPDFApp) => {
+			if (app.__phantomHooked) return;
+			const originalOpen = app.open.bind(app);
+			
+			app.open = async (args: PDFOpenArgs) => {
+				if (args && args.url && typeof args.url === 'string') {
+					try {
+						// 1. 剥离 Obsidian 每次加载生成的类似 ?123456 的随机查询缓存参数
+						const urlWithoutQuery = args.url.split('?')[0];
+
+						// 2. 利用前置映射字典查找真实的 Vault 文件物理路径
+						if (urlWithoutQuery) {
+							const vaultPath = this.resourcePathToVaultPath.get(urlWithoutQuery);
+
+							if (vaultPath) {
+								// 3. 读取头部签名校验是否为加密文件
+								const rawHead = await this.originalReadBinary(vaultPath).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+								
+								if (this.crypto.isEncrypted(rawHead)) {
+									if (!this.hasPassword()) await this.fetchKeys();
+									if (!this.hasPassword()) {
+										this.notifyPasswordMissing();
+										throw new Error(i18n.t('ERR_PWD_MISSING') || "Password missing");
+									}
+
+									// 4. 将原生加载行为在此处强制改为读取完整二进制流解密
+									const rawBuffer = await this.originalReadBinary(vaultPath);
+									const tKek = await this.getTmpKEK();
+									const tDek = await this.getTmpDEK();
+									const result = await this.crypto.decryptFile(new Uint8Array(rawBuffer), tDek, tKek, this.vaultKID);
+									
+									if (result && result.data) {
+										// 5. 将原生入参偷偷替换为解密完的 Uint8Array，然后抛弃 URL
+										// 使 PDF.js 完全打消使用网络 Fetch 跨钩子加载本地文件的企图
+										args.data = result.data;
+										delete args.url;
+									}
+								}
+							}
+						}
+					} catch (e) {
+						// 此处截获错误不向上传导阻断，让 PDF.js 自行崩溃按原生流程抛出正确的本地损坏错误
+						console.error("PhantomCipher PDF Intercept Error:", e);
+					}
+				}
+				return originalOpen(args);
+			};
+			app.__phantomHooked = true;
+		};
+
+		const targetWindow = window as unknown as ObsidianWindow;
+		let _pdfjsViewer = targetWindow.pdfjsViewer;
+		
+		Object.defineProperty(targetWindow, 'pdfjsViewer', {
+			get: () => _pdfjsViewer,
+			set: (val: PDFjsViewer | undefined) => {
+				_pdfjsViewer = val;
+				if (_pdfjsViewer && _pdfjsViewer.createObsidianPDFViewer) {
+					const originalCreate = _pdfjsViewer.createObsidianPDFViewer;
+					if (!originalCreate.__phantomHooked) {
+						_pdfjsViewer.createObsidianPDFViewer = function(this: unknown, ...args: unknown[]) {
+							const app = originalCreate.call(this, ...args);
+							hookApp(app); // 针对每一个新的 PDF 标签实例做 Hook 绑定
+							return app;
+						};
+						_pdfjsViewer.createObsidianPDFViewer.__phantomHooked = true;
+					}
+				}
+			},
+			configurable: true
+		});
+
+		// 避免出现热重载插件/懒加载导致 PDF 组件已经被初始化过了，没有命中监听赋值操作的情况
+		if (_pdfjsViewer && _pdfjsViewer.createObsidianPDFViewer) {
+			const originalCreate = _pdfjsViewer.createObsidianPDFViewer;
+			if (!originalCreate.__phantomHooked) {
+				_pdfjsViewer.createObsidianPDFViewer = function(this: unknown, ...args: unknown[]) {
+					const app = originalCreate.call(this, ...args);
+					hookApp(app);
+					return app;
+				};
+				_pdfjsViewer.createObsidianPDFViewer.__phantomHooked = true;
 			}
 		}
 	}
@@ -695,137 +1054,128 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		// 拦截资源路径。如果是加密媒体文件，返回解密后的 Blob URL。
 		adapter.getResourcePath = (path: string): string => {
+			// 无论是否从 Blob 吐出结果，率先通过 Obsidian 底层拿到真实关联协议路径
+			// 并在内部维护一套映射关系字典，供上层 PDF 拦截器回推映射时使用
+			const originalUrl = this.originalGetResourcePath(path);
+			const urlWithoutQuery = originalUrl.split('?')[0];
+			if (urlWithoutQuery) {
+				this.resourcePathToVaultPath.set(urlWithoutQuery, path);
+			}
+
 			if (this.blobUrlCache.has(path)) {
 				const url = this.blobUrlCache.get(path)!;
-				this.blobUrlCache.delete(path);
-				this.blobUrlCache.set(path, url);
 				return url;
 			}
-			return this.originalGetResourcePath(path);
+			return originalUrl;
+		};
+
+		// 通用的读取解密中间件
+		const processRead = async (path: string, content: string | ArrayBuffer): Promise<{ text?: string, buffer?: ArrayBuffer } | null> => {
+			const isString = typeof content === 'string';
+
+			const probeData = isString ? content : new Uint8Array(content).subarray(0, MAGIC_HEADER.length);
+			if (path.startsWith(configDir) || !this.crypto.isEncrypted(probeData)) return isString ? { text: content } : { buffer: content };
+
+			// 如果初次读取时钥匙串还未装载完成，强制阻塞等待
+			if (!this.hasPassword()) await this.fetchKeys();
+
+			if (!this.hasPassword()) {
+				this.decryptedPaths.delete(path);
+				this.notifyPasswordMissing();
+				// 未解锁密码时，对于试图请求二进制附件的操作强行返回长度为 0 的空白 Buffer
+				return isString ? { text: content } : { buffer: new ArrayBuffer(0) };
+			}
+
+			const armoredData = isString ? content : new Uint8Array(content);
+
+			// 动态 XOR 还原 Key 用于解密
+			const tKek = await this.getTmpKEK();
+			const tDek = await this.getTmpDEK();
+
+			try {
+				const result = await this.crypto.decryptFile(armoredData, tDek, tKek, this.vaultKID);
+				if (result) {
+					// 使用文件自身附带的 EDEK 解开，下次保存时将自动迁移至当前库 DEK
+					this.decryptedPaths.add(path);
+					// 读取出的明文流在交付给 Obsidian 时提取为其底层的 CleanBuffer 以防部分底层插件挂载报错
+					return isString ? { text: new TextDecoder().decode(result.data) } : { buffer: this.crypto.getCleanBuffer(result.data) };
+				}
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				// 不支持 V1 加密格式
+				if (msg === 'UNSUPPORTED_V1') {
+					this.notifyV1Unsupported();
+				} else if (msg.startsWith('KID_MISMATCH:')) {
+					this.notifyKidMismatch(path, msg.split(':')[1]!);
+				} else {
+					this.notifyDecryptFailed(path);
+				}
+			}
+
+			this.decryptedPaths.delete(path);
+			return isString ? { text: content } : { buffer: new ArrayBuffer(0) };
 		};
 
 		// 拦截 CachedRead，确保 Obsidian 内部缓存系统拿到的是解密后的明文
 		vault.cachedRead = async (file: TFile): Promise<string> => {
 			const content = await this.originalVaultCachedRead(file);
-
-			if (file.path.startsWith(configDir) || !this.crypto.isEncrypted(content)) return content;
-
-			if (!this.hasPassword()) await this.fetchPassword();
-
-			if (!this.hasPassword()) {
-				this.decryptedPaths.delete(file.path); // 未解密
-				this.notifyPasswordMissing(); // 提示设置密码
-				return content; // 返回密文原始内容
-			}
-
-			const decryptedText = await this.withPassword(async (pwdBytes) => {
-				const decrypted = await this.crypto.decrypt(content, pwdBytes);
-				if (decrypted) {
-					this.decryptedPaths.add(file.path); // 解密成功
-					const text = new TextDecoder().decode(decrypted);
-
-					decrypted.fill(0);
-					return text;
-				}
-				return null;
-			});
-
-			if (decryptedText !== null) return decryptedText;
-
-			this.decryptedPaths.delete(file.path); // 解密失败
-			this.notifyDecryptFailed(file.path);
-			return content;
+			const res = await processRead(file.path, content);
+			return res ? (res.text !== undefined ? res.text : content) : content;
 		};
 
 		// 处理文本读取：如果是加密文件则自动解密
 		vault.read = async (file: TFile): Promise<string> => {
 			const content = await this.originalVaultRead(file);
-			if (file.path.startsWith(configDir) || !this.crypto.isEncrypted(content)) return content;
-
-			if (!this.hasPassword()) await this.fetchPassword();
-
-			if (!this.hasPassword()) {
-				this.decryptedPaths.delete(file.path);
-				this.notifyPasswordMissing();
-				return content;
-			}
-
-			const decryptedText = await this.withPassword(async (pwdBytes) => {
-				const decrypted = await this.crypto.decrypt(content, pwdBytes);
-				if (decrypted) {
-					this.decryptedPaths.add(file.path);
-					const text = new TextDecoder().decode(decrypted);
-
-					decrypted.fill(0);
-					return text;
-				}
-				return null;
-			});
-
-			if (decryptedText !== null) return decryptedText;
-
-			this.decryptedPaths.delete(file.path);
-			this.notifyDecryptFailed(file.path);
-			return content;
+			const res = await processRead(file.path, content);
+			return res ? (res.text !== undefined ? res.text : content) : content;
 		};
 
 		// 处理二进制读取：支持附件透明解密
 		vault.readBinary = async (file: TFile): Promise<ArrayBuffer> => {
-			const data = await this.originalVaultReadBinary(file);
-			if (file.path.startsWith(configDir) || !this.crypto.isEncrypted(data.slice(0, MAGIC_HEADER.length))) return data;
 
-			if (!this.hasPassword()) await this.fetchPassword();
-
-			if (!this.hasPassword()) {
-				this.decryptedPaths.delete(file.path);
-				this.notifyPasswordMissing();
-				return data;
+			// 在读取二进制前，如果缓存已有且没过期，直接返回已处理的 Buffer 模拟
+			if (this.blobUrlCache.has(file.path) && this.blobMtimeCache.get(file.path) === file.stat.mtime) {
+				// 缓存命中策略由内部预处理实现
 			}
 
-			const decryptedData = await this.withPassword(async (pwdBytes) => {
-				const armoredText = new TextDecoder().decode(data);
-				const decrypted = await this.crypto.decrypt(armoredText, pwdBytes);
-				if (decrypted) {
-					this.decryptedPaths.add(file.path);
-					// 针对媒体文件生成 Blob URL，让 app:// 协议能显示加密图片
-					const ext = file.path.split('.').pop()?.toLowerCase() || '';
-					if (PREVIEW_SUPPORTED.has(ext)) {
-						const blob = new Blob([this.crypto.toBuffer(decrypted)], { type: this.getMimeType(ext) });
-						const url = URL.createObjectURL(blob);
-						// 使用 LRU 方式存储缓存
-						this.addToBlobCache(file.path, url);
-					}
-					return this.crypto.toBuffer(decrypted);
+			const d = await this.originalVaultReadBinary(file);
+			const r = await processRead(file.path, d);
+			if (r && r.buffer && this.decryptedPaths.has(file.path)) {
+				// 针对媒体文件生成 Blob URL，让 app:// 协议能显示加密图片
+				const ext = file.extension.toLowerCase();
+				if (PREVIEW_SUPPORTED.has(ext)) {
+					const blob = new Blob([r.buffer], { type: this.getMimeType(ext) });
+					// 使用 LRU 方式存储缓存
+					this.addToBlobCache(file.path, URL.createObjectURL(blob), file.stat.mtime);
 				}
-				return null;
-			});
-
-			if (decryptedData !== null) return decryptedData;
-
-			this.decryptedPaths.delete(file.path);
-			this.notifyDecryptFailed(file.path);
-			return data;
+			}
+			return r?.buffer !== undefined ? r.buffer : d;
 		};
 
 		/**
-		 * 写入逻辑处理器：根据插件模式决定是否加密落地数据
+		 * 写入逻辑处理器：零信任校验与动态落地
 		 */
-		const handleWrite = async (path: string, data: Uint8Array): Promise<string | Uint8Array | null> => {
-			if (path.startsWith(configDir)) {
-				return data;
+		const handleWrite = async (path: string, data: Uint8Array, isText: boolean): Promise<string | Uint8Array | null> => {
+			if (path.startsWith(configDir)) return data;
+
+			// 内存限制
+			if (data.byteLength > MAX_FILE_SIZE) {
+				new Notice(i18n.t('ERR_2GB_LIMIT'));
+				return null;
 			}
 
-			if (!this.hasPassword()) await this.fetchPassword();
+			// 写入前检查，防止钥匙串脱机
+			if (!this.hasPassword()) await this.fetchKeys();
 			const hasPwd = this.hasPassword();
 			const ext = path.split('.').pop()?.toLowerCase() || '';
 
-			// 仅读取前 10 字节判断文件是否原本直接就是加密状态
+			// 仅读取前 7 字节判断文件是否原本直接就是加密状态
 			let isCurrentlyEncrypted = false;
 			try {
 				const head = await this.originalReadBinary(path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
 				isCurrentlyEncrypted = this.crypto.isEncrypted(head);
-			} catch {
-				// 合规地忽略文件无法探测的初始化情况
+			} catch (_e) {
+				void _e;
 			}
 
 			// 判断即将写入的内容本身是否带有加密头标识
@@ -837,33 +1187,30 @@ export default class PhantomCipherPlugin extends Plugin {
 			if (isIncomingEncrypted) {
 				if (!hasPwd) {
 					// 若当前设备未解锁，则无法验证密文的真伪
-					// 为防止垃圾数据覆写破坏本地文件，在此刻无条件拒绝写入并利用通知提醒用户。
+					// 为防止垃圾数据覆写破坏本地文件，在此刻无条件拒绝写入并利用通知提醒用户
 					this.notifyPasswordMissing();
 					return null;
 				}
 
 				// 强制试解密即将落盘的载荷
-				const isValid = await this.withPassword(async (pwdBytes) => {
-					const armoredText = new TextDecoder().decode(data);
-					const decrypted = await this.crypto.decrypt(armoredText, pwdBytes);
-					if (decrypted) {
-						decrypted.fill(0); // 验证通过即刻销毁明文内存
-						return true;
+				const payloadToVerify = isText ? new TextDecoder().decode(data) : data;
+				try {
+					const tKek = await this.getTmpKEK();
+					const tDek = await this.getTmpDEK();
+					const isValid = await this.crypto.decryptFile(payloadToVerify, tDek, tKek, this.vaultKID);
+					if (isValid) {
+						// 验证通过：确认为当前密码下合法的密文（如同步插件写入）
+						// 立刻将此文件路径加入已信任名单，并将中转的 data 原路返回给底层完成物理落盘。
+						this.decryptedPaths.add(path);
+						return data;
 					}
-					return false;
-				});
-
-				if (isValid) {
-					// 验证通过：确认为当前密码下合法的密文（如同步插件写入）
-					// 立刻将此文件路径加入已信任名单，并将中转的 data 原路返回给底层完成物理落盘。
-					this.decryptedPaths.add(path);
-					return data;
-				} else {
-					// 验证失败：载荷损坏、不同密码或蓄意伪造
-					// 向用户抛出具有具体文件名的警告，并拒绝写入保护本地文件。
-					this.notifyDecryptFailed(path);
-					return null;
+				} catch (_e) {
+					void _e;
 				}
+				// 验证失败：载荷损坏、不同密码或蓄意伪造
+				// 向用户抛出具有具体文件名的警告，并拒绝写入保护本地文件。
+				this.notifyDecryptFailed(path);
+				return null;
 			}
 
 			// 以下为即将写入明文数据时的处理
@@ -885,38 +1232,45 @@ export default class PhantomCipherPlugin extends Plugin {
 			);
 
 			if (shouldEncrypt) {
-				const encryptedResult = await this.withPassword(async (pwdBytes) => {
-					return await this.crypto.encrypt(data, pwdBytes, !NON_COMPRESSIBLE.has(ext));
-				});
+				const tDek = await this.getTmpDEK();
+
+				// 写入时，如果由于某种极端情况空缺核心凭据，拒绝加密
+				if (!tDek || !this.vaultEDEK || !this.vaultKID) return null;
+
+				// 无论此文件之前是用什么分裂的附属 EDEK 读出来的，此时一律使用当前的 vaultDEK 进行被动统一写回。
+				const encryptedResult = await this.crypto.encryptFile(
+					data,
+					tDek,
+					this.vaultEDEK,
+					this.vaultKID,
+					!NON_COMPRESSIBLE.has(ext),
+					!isText // 如果源不是 Text，则打包为纯二进制落地
+				);
+
 				if (encryptedResult) {
 					// 自身完成加密落盘后同步录入信任名单
 					this.decryptedPaths.add(path);
 					return encryptedResult;
 				}
 			}
-
 			// 不满足加密条件，执行正常的明文放行
 			return data;
 		};
 
 		adapter.write = async (path: string, data: string, options?: DataWriteOptions): Promise<void> => {
-			const result = await handleWrite(path, new TextEncoder().encode(data));
+			const result = await handleWrite(path, new TextEncoder().encode(data), true);
 			if (result === null) return;
-			if (typeof result === 'string') {
-				await this.originalWrite(path, result, options);
-			} else {
-				await this.originalWriteBinary(path, this.crypto.toBuffer(result), options);
-			}
+			// 如果底层文件以二进制落地写入，调用安全的 getCleanBuffer 向底层交付提取物
+			if (typeof result === 'string') await this.originalWrite(path, result, options);
+			else await this.originalWriteBinary(path, this.crypto.getCleanBuffer(result), options);
 		};
 
 		adapter.writeBinary = async (path: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> => {
-			const result = await handleWrite(path, new Uint8Array(data));
+			const result = await handleWrite(path, new Uint8Array(data), false);
 			if (result === null) return;
-			if (typeof result === 'string') {
-				await this.originalWrite(path, result, options);
-			} else {
-				await this.originalWriteBinary(path, this.crypto.toBuffer(result), options);
-			}
+			// 同上应用 getCleanBuffer 提取交付
+			if (typeof result === 'string') await this.originalWrite(path, result, options);
+			else await this.originalWriteBinary(path, this.crypto.getCleanBuffer(result), options);
 		};
 	}
 
@@ -933,7 +1287,8 @@ export default class PhantomCipherPlugin extends Plugin {
 				await this.app.vault.readBinary(file);
 				return true;
 			}
-		} catch {
+		} catch (_e) {
+			void _e;
 			// 静默跳过探测不到的媒体文件
 		}
 		return false;
@@ -990,13 +1345,18 @@ export default class PhantomCipherPlugin extends Plugin {
 			this.statusBarItem.empty();
 			if (isEnc) {
 				this.statusBarItem.show();
-
-				// 解密成功绿色，未成功（只读）红色
-				this.statusBarItem.toggleClass("is-transparent", isTransparent);
-				this.statusBarItem.toggleClass("is-locked", !isTransparent);
+				this.statusBarItem.removeClass("is-transparent", "is-locked");
 
 				const span = this.statusBarItem.createSpan();
-				setIcon(span, "lock");
+
+				// 解密成功绿色，锁定只读红色
+				if (isTransparent) {
+					this.statusBarItem.addClass("is-transparent");
+					setIcon(span, "unlock");
+				} else {
+					this.statusBarItem.addClass("is-locked");
+					setIcon(span, "lock");
+				}
 
 				// 移动端仅显示图标，非移动端根据解密实况显示文字
 				if (!Platform.isMobile) {
@@ -1027,82 +1387,136 @@ export default class PhantomCipherPlugin extends Plugin {
 
 			// 3. 阻塞等待：确保所有相关的加密附件都已解密并生成 Blob URL
 			if (warmupTasks.length > 0) {
-				const results = await Promise.all(warmupTasks);
+				let anySuccess = false;
+				for (const task of warmupTasks) {
+					const isGenerated = await task;
+					if (isGenerated) anySuccess = true;
+				}
+
 				// 如果产生了任何一个新解密的映射，触发 DOM 重载以修复媒体错位。
-				if (results.some(r => r)) {
+				if (anySuccess) {
 					this.fixMediaDOM();
 				}
 			}
 
-		} catch {
+		} catch (_e) {
+			void _e;
 			this.statusBarItem.hide();
 		}
 	}
 
+
 	/**
 	 * 安全转换机制
-	 * 逻辑：写入副本 -> 校验副本 -> 替换原件
+	 * 逻辑：读取 -> 写入副本 -> 校验副本 -> 替换原件
 	 */
 	private async safeConvertProcess(path: string, extension: string, action: 'encrypt' | 'decrypt'): Promise<boolean> {
 		const tempPath = normalizePath(path + ".phantom_tmp");
 		try {
-			let originalDataLength = 0;
+			let originalDataHash = "";
+			let expectedHashFromExt = "";
 
-			const convertResult = await this.withPassword(async (pwdBytes) => {
-				let targetData: Uint8Array | string;
+			const isText = ["md", "canvas", "txt", "json", "css"].includes(extension);
 
-				// 1. 内存转换
-				if (action === 'encrypt') {
-					// 物理层获取原本的数据执行加密
-					const data = new Uint8Array(await this.originalReadBinary(path));
-					originalDataLength = data.byteLength;
-					targetData = await this.crypto.encrypt(data, pwdBytes, !NON_COMPRESSIBLE.has(extension));
+			const tKek = await this.getTmpKEK();
+			const tDek = await this.getTmpDEK();
+
+			// 强制确保安全转化时 KEK 和 DEK 就位
+			if (!tDek || !this.vaultEDEK || !this.vaultKID) throw new Error(i18n.t('ERR_MISSING_CREDENTIALS'));
+
+			// 1. 读取文件
+			if (action === 'encrypt') {
+				let rawRead: ArrayBuffer | null = await this.originalReadBinary(path);
+				if (rawRead.byteLength > MAX_FILE_SIZE) throw new Error(i18n.t('ERR_2GB_LIMIT'));
+
+				let data: Uint8Array | null = new Uint8Array(rawRead);
+				rawRead = null;
+
+				originalDataHash = this.crypto.calculateChecksum(data);
+				let targetData: Uint8Array | string | null = await this.crypto.encryptFile(data, tDek, this.vaultEDEK, this.vaultKID, !NON_COMPRESSIBLE.has(extension), !isText);
+
+				data.fill(0);
+				data = null; // 完成加密后立即丢弃原件的明文驻留
+
+				if (typeof targetData === 'string') {
+					await this.originalWrite(tempPath, targetData);
 				} else {
-					// 物理层提取原密文用于解密
-					const rawText = await this.originalRead(path);
-					const decrypted = await this.crypto.decrypt(rawText, pwdBytes);
-					if (!decrypted) throw new Error(i18n.t('ERR_MEM_DECRYPT'));
-					targetData = decrypted;
-					originalDataLength = decrypted.byteLength;
+					await this.originalWriteBinary(tempPath, this.crypto.getCleanBuffer(targetData));
+					// 完成加密提取后，应当立刻擦除读入的源文件明文，防止留在内存
+					targetData.fill(0);
+				}
+				targetData = null; // 写入磁盘后立即释放产出缓冲
+			} else {
+				let rawBuffer: ArrayBuffer | null = await this.originalReadBinary(path);
+				if (rawBuffer.byteLength > MAX_FILE_SIZE) throw new Error(i18n.t('ERR_2GB_LIMIT'));
+
+				let rawBytes: Uint8Array | null = new Uint8Array(rawBuffer);
+				rawBuffer = null;
+
+				const res = await this.crypto.decryptFile(rawBytes, tDek, tKek, this.vaultKID);
+				rawBytes = null; // 切断加密源文件引用
+
+				if (!res) throw new Error(i18n.t('ERR_MEM_DECRYPT'));
+
+				let targetData: Uint8Array | string | null;
+				if (isText) {
+					targetData = new TextDecoder().decode(res.data);
+				} else {
+					targetData = res.data;
+				}
+
+				originalDataHash = this.crypto.calculateChecksum(res.data);
+				expectedHashFromExt = res.ph || "";
+
+				// 如果加密头中含有正确的 ph 记录，执行校验保证解密数据未在逻辑上受损
+				if (expectedHashFromExt && expectedHashFromExt !== originalDataHash) {
+					if (targetData instanceof Uint8Array) targetData.fill(0);
+					res.data.fill(0);
+					throw new Error(i18n.t('ERR_VAL_DEC_MISMATCH'));
 				}
 
 				// 2. 写入副本
 				if (typeof targetData === 'string') {
 					await this.originalWrite(tempPath, targetData);
 				} else {
-					await this.originalWriteBinary(tempPath, this.crypto.toBuffer(targetData));
+					await this.originalWriteBinary(tempPath, this.crypto.getCleanBuffer(targetData));
+					targetData.fill(0);
 				}
+				targetData = null;
+				res.data.fill(0);
+			}
 
-				// 3. 副本校验
-				const tempRead = await this.originalReadBinary(tempPath);
-				if (action === 'encrypt') {
-					const tempArmored = new TextDecoder().decode(tempRead);
-					const testPlain = await this.crypto.decrypt(tempArmored, pwdBytes);
-					if (!testPlain || testPlain.byteLength !== originalDataLength) {
-						if (testPlain) testPlain.fill(0);
-						throw new Error(i18n.t('ERR_VAL_ENC_CORRUPT'));
-					}
-					testPlain.fill(0);
-				} else {
-					if (tempRead.byteLength !== (targetData as Uint8Array).byteLength) {
-						if (targetData instanceof Uint8Array) targetData.fill(0);
-						throw new Error(i18n.t('ERR_VAL_DEC_MISMATCH'));
-					}
+			// 3. 副本校验
+			let tempRead: ArrayBuffer | null = await this.originalReadBinary(tempPath);
+			if (action === 'encrypt') {
+				let tempBytes: Uint8Array | null = new Uint8Array(tempRead);
+				tempRead = null;
+				const testResult = await this.crypto.decryptFile(tempBytes, tDek, tKek, this.vaultKID);
+				tempBytes = null;
+
+				// 解密临时密文副本，对其进行重新 Hash 并比对
+				if (!testResult || this.crypto.calculateChecksum(testResult.data) !== originalDataHash) {
+					if (testResult && testResult.data) testResult.data.fill(0);
+					throw new Error(i18n.t('ERR_VAL_ENC_CORRUPT'));
 				}
-
-				if (targetData instanceof Uint8Array) targetData.fill(0);
-
-				return true;
-			});
-
-			if (!convertResult) return false;
+				testResult.data.fill(0);
+			} else {
+				let tempBytes: Uint8Array | null = new Uint8Array(tempRead);
+				tempRead = null;
+				const tempReadHash = this.crypto.calculateChecksum(tempBytes);
+				tempBytes = null;
+				// 解密输出的副本校验
+				if (tempReadHash !== originalDataHash) {
+					throw new Error(i18n.t('ERR_VAL_DEC_MISMATCH'));
+				}
+			}
 
 			// 4. 原子替换：删除原件并重命名副本
 			// 在某些情况 rename 可能会失败，先 remove 再 rename
 			try {
 				await this.app.vault.adapter.remove(path);
-			} catch {
-				/* 文件如果被强行抢占或不存在，忽略错误，让下面继续执行覆盖尝试 */
+			} catch (_e) {
+				void _e;
 			}
 
 			// 获取临时文件的抽象引用并重命名
@@ -1110,7 +1524,6 @@ export default class PhantomCipherPlugin extends Plugin {
 			if (tempAbstractFile) {
 				await this.app.vault.rename(tempAbstractFile, path);
 			} else {
-				// 如果 Vault API 没能即时识别临时文件，回退到 Adapter API 重命名
 				await this.app.vault.adapter.rename(tempPath, path);
 			}
 
@@ -1122,11 +1535,14 @@ export default class PhantomCipherPlugin extends Plugin {
 			return true;
 
 		} catch (e) {
-			const message = e instanceof Error ? e.message : String(e);
-			// 失败时尝试清理副本，如果清理失败说明是系统问题，保留副本给用户手动抢救
-			console.error(i18n.t('LOG_ERR_CONVERSION', { path }), message);
-			try { await this.app.vault.adapter.remove(tempPath); } catch { /* 忽略清理失败 */ }
-			return false;
+			// 转换失败时清理副本
+			try {
+				await this.app.vault.adapter.remove(tempPath);
+			} catch (_e) {
+				void _e;
+			}
+			// 将错误向上抛出，由 UI 层负责具体的 Notice 逻辑
+			throw e;
 		}
 	}
 
@@ -1147,14 +1563,36 @@ export default class PhantomCipherPlugin extends Plugin {
 		}
 
 		const action = isEnc ? 'decrypt' : 'encrypt';
+		
+		// 创建占位 Notice
+		const progressNotice = new Notice(`${i18n.t('NOTICE_CONVERTING')}: ${file.name}...`, 0);
 
-		// 接入带有校验恢复机制的安全转换流
-		const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action);
+		try {
+			// 接入带有校验恢复机制的安全转换流
+			await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action);
 
-		if (success) {
-			new Notice(isEnc ? i18n.t('NOTICE_RESTORED', { name: file.name }) : i18n.t('NOTICE_ENCRYPTED', { name: file.name }));
-		} else {
-			new Notice(i18n.t('NOTICE_FAILED', { name: file.name }));
+			progressNotice.hide();
+
+			// 转换成功后，直接替换原占位 Notice 内容
+			new Notice(isEnc 
+				? i18n.t('NOTICE_RESTORED', { name: file.name }) 
+				: i18n.t('NOTICE_ENCRYPTED', { name: file.name }), 5000);
+		} catch (e) {
+			progressNotice.hide();
+			const message = e instanceof Error ? e.message : String(e);
+
+			if (message.startsWith('KID_MISMATCH:')) {
+				const kid = message.split(':')[1] ?? '';
+				new Notice(i18n.t('ERR_KID_MISMATCH', { name: file.name, kid: kid }), 8000);
+				this.notifyKidMismatch(file.path, kid);
+			} else if (isEnc) {
+				new Notice(i18n.t('NOTICE_CONVERT_FAIL_LOCKED', { name: file.name }), 8000);
+			} else {
+				new Notice(i18n.t('NOTICE_FAILED', { name: file.name }), 8000);
+			}
+
+			// 同时在控制台打印原始错误方便排查
+			console.error(i18n.t('LOG_ERR_CONVERSION') + " " + file.path, e);
 		}
 
 		await this.updateStatusBar(file);
@@ -1162,12 +1600,13 @@ export default class PhantomCipherPlugin extends Plugin {
 
 	/**
 	 * 批量处理文件夹下的加解密逻辑
-	 * 采用底层安全旁路执行，通过读取/写入底层原生的 adapter API 绕开 Hook，防止死循环。
 	 */
 	private async batchProcessFolder(folder: TFolder, action: 'encrypt' | 'decrypt') {
-		if (!this.hasPassword()) { new Notice(i18n.t('NOTICE_SET_PASSWORD')); return; }
+		if (!this.hasPassword()) { this.notifyPasswordMissing(); return; }
 
 		let successCount = 0;
+		let failCount = 0;      // 物理性转换失败（如写入冲突、损坏）
+		let mismatchCount = 0;  // 逻辑性跳过（KID 不匹配）
 		const isEncryptAction = action === 'encrypt';
 
 		// 递归遍历目标文件夹的 children 树
@@ -1186,42 +1625,235 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		recursiveCollect(folder);
 
+		new Notice(i18n.t('NOTICE_BATCH_START', { count: targetFiles.length }), 3000);
+
 		// 使用动态 Notice 显示进度
-		const progressNotice = new Notice(i18n.t('NOTICE_BATCH_START', { count: targetFiles.length }), 0);
+		const progressNotice = new Notice('', 0);
 
 		for (let i = 0; i < targetFiles.length; i++) {
 			const file = targetFiles[i]!;
-			// 更新进度条文字
-			progressNotice.setMessage(`🚀 ${i18n.t(isEncryptAction ? 'MODE_ENCRYPT' : 'MODE_DECRYPT')}... (${i + 1}/${targetFiles.length})`);
+			const actionName = i18n.t(isEncryptAction ? 'ACTION_ENCRYPT' : 'ACTION_DECRYPT');
 
+			// 更新进度条文字
+			progressNotice.setMessage(i18n.t('NOTICE_BATCH_PROGRESS', {
+				current: i + 1,
+				total: targetFiles.length,
+				action: actionName,
+				name: file.name
+			}));
 			try {
 				// 直接通过底层 Adapter 探查头信息判断状态
 				const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
 				const isEnc = this.crypto.isEncrypted(rawHead);
 
+				// 只有状态不符合目标状态时才执行转换
 				if ((isEncryptAction && !isEnc) || (!isEncryptAction && isEnc)) {
 					// 接入带有校验恢复机制的安全转换流
-					const success = await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action);
-					if (success) successCount++;
+					await this.safeConvertProcess(file.path, file.extension.toLowerCase(), action);
+					successCount++;
 				}
 			} catch (e) {
-				const actionName = isEncryptAction ? i18n.t('MODE_ENCRYPT') : i18n.t('MODE_DECRYPT');
-				console.error(i18n.t('LOG_BATCH_ERROR', { action: actionName, path: file.path }), e);
+				const message = e instanceof Error ? e.message : String(e);
+				const actionName = i18n.t(isEncryptAction ? 'ACTION_ENCRYPT' : 'ACTION_DECRYPT');
+
+				// 错误分流记录
+				if (message.startsWith('KID_MISMATCH:')) {
+					// 密钥不匹配引起的跳过
+					mismatchCount++;
+					this.notifyKidMismatch(file.path, message.split(':')[1]!);
+				} else if (message === 'UNSUPPORTED_V1') {
+					// V1 格式不支持
+					failCount++;
+					this.notifyV1Unsupported();
+				} else {
+					// 其他未知失败
+					failCount++;
+					console.error(i18n.t('LOG_BATCH_ERROR', { action: actionName, path: file.path }), e);
+				}
+				// 批处理中单个文件失败不中断循环，继续处理后续文件
 			}
 		}
 
 		progressNotice.hide(); // 处理完后关闭进度条
-		new Notice(i18n.t('NOTICE_BATCH_FINISH', { count: successCount }));
+
+		// 最终汇总通知：展示成功、失败、以及因密钥不匹配跳过的数量
+		new Notice(i18n.t('NOTICE_BATCH_FINISH', {
+			count: successCount,
+			failed: failCount,
+			mismatch: mismatchCount
+		}), 5000); // 增加停留时间方便用户看清数据
+
 		void this.updateStatusBar(this.app.workspace.getActiveFile());
 	}
 
 	async loadSettings() {
 		const loadedData = (await this.loadData()) as unknown;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData as Partial<PhantomCipherSettings>);
+
+		let dirty = false;
+		if (!this.settings.kekId) { this.settings.kekId = "phantom-kek-" + Math.random().toString(36).substring(2, 7); dirty = true; }
+		if (!this.settings.dekId) { this.settings.dekId = "phantom-dek-" + Math.random().toString(36).substring(2, 7); dirty = true; }
+		if (dirty) await this.saveSettings();
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	/** 暴露提供给 Modal 验证旧密码的辅助接口 */
+	public async getTestKEKRaw(pwd: string): Promise<Uint8Array> {
+		return await this.crypto.deriveKEK(pwd);
+	}
+
+	/** 暴露提供给 Modal 跨界拉取内存凭据的方式*/
+	public getVaultKEKRaw(): Uint8Array | null {
+		return this.secureKEK ? this.secureKEK.get() : null;
+	}
+
+	public getVaultDEKRaw(): Uint8Array | null {
+		return this.secureDEK ? this.secureDEK.get() : null;
+	}
+}
+
+/**
+ * 密码变更面板
+ */
+class PasswordModal extends Modal {
+	plugin: PhantomCipherPlugin;
+	onCloseCallback: () => void;
+	oldPwd = "";
+	newPwd = "";
+
+	constructor(app: App, plugin: PhantomCipherPlugin, onCloseCallback: () => void) {
+		super(app);
+		this.plugin = plugin;
+		this.onCloseCallback = onCloseCallback;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: i18n.t('MODAL_PWD_TITLE') });
+
+		if (this.plugin.hasPassword()) {
+			new Setting(contentEl)
+				.setName(i18n.t('MODAL_OLD_PWD'))
+				.addText(t => { t.inputEl.type = 'password'; t.onChange(v => this.oldPwd = v); });
+
+			new Setting(contentEl)
+				.setName(i18n.t('MODAL_NEW_PWD'))
+				.setDesc(i18n.t('MODAL_NEW_PWD_DESC'))
+				.addText(t => { t.inputEl.type = 'password'; t.onChange(v => this.newPwd = v); });
+		} else {
+			new Setting(contentEl)
+				.setName(i18n.t('MODAL_NEW_PWD'))
+				.addText(t => { t.inputEl.type = 'password'; t.onChange(v => this.newPwd = v); });
+		}
+
+		new Setting(contentEl)
+			.addButton(b => b.setButtonText(i18n.t('BTN_CONFIRM'))
+				.setCta()
+				.onClick(async () => {
+					b.setButtonText(i18n.t('BTN_DERIVING')).setDisabled(true);
+					await this.handleConfirm();
+					b.setButtonText(i18n.t('BTN_CONFIRM')).setDisabled(false);
+				}))
+			.addButton(b => b.setButtonText(i18n.t('BTN_CANCEL')).onClick(() => this.close()));
+	}
+
+	async handleConfirm() {
+		try {
+			if (!this.plugin.app.secretStorage) {
+				throw new Error(i18n.t('ERR_NO_SECRET_STORAGE'));
+			}
+
+			// 如果已存在密码，强制拦截并校验旧密码
+			if (this.plugin.hasPassword()) {
+				const testKekRaw = await this.plugin.getTestKEKRaw(this.oldPwd);
+				const vaultKekRaw = this.plugin.getVaultKEKRaw();
+				let isMatch = false;
+
+				try {
+					isMatch = vaultKekRaw ? this.plugin.crypto.compareBytes(testKekRaw, vaultKekRaw) : false;
+				} finally {
+					testKekRaw.fill(0);
+					if (vaultKekRaw) vaultKekRaw.fill(0);
+				}
+
+				if (!isMatch) {
+					new Notice(i18n.t('ERR_PWD_WRONG'));
+					return;
+				}
+
+				// 清除模式
+				if (this.newPwd === "") {
+					this.plugin.app.secretStorage.setSecret(this.plugin.settings.kekId, "");
+					this.plugin.app.secretStorage.setSecret(this.plugin.settings.dekId, "");
+
+					this.plugin.clearInternalState();
+					new Notice(i18n.t('NOTICE_PWD_CLEARED'));
+					void this.plugin.fetchKeys();
+					this.close();
+					return;
+				}
+			}
+
+			// 全新派生与替换流
+			const newKekRaw = await this.plugin.crypto.deriveKEK(this.newPwd);
+			try {
+				const newKek = await this.plugin.crypto.importGCMKey(newKekRaw);
+
+				let newEdek = "";
+
+				// 如果系统内原先存在 DEK 原材料，尝试提取并使用新 KEK 重新包裹它 (信封更换)
+				const currentDekRaw = this.plugin.getVaultDEKRaw();
+
+				if (currentDekRaw) {
+					try {
+						newEdek = await this.plugin.crypto.encryptDEK(currentDekRaw, newKek);
+					} finally {
+						currentDekRaw.fill(0);
+					}
+				} else {
+					// 这是一个纯净初始化的库，直接生成全新的全局 DEK 体系
+					const freshDekRaw = crypto.getRandomValues(new Uint8Array(32));
+					try {
+						newEdek = await this.plugin.crypto.encryptDEK(freshDekRaw, newKek);
+					} finally {
+						freshDekRaw.fill(0);
+					}
+				}
+
+				const kekBase64 = this.plugin.crypto.safeBase64Encode(newKekRaw);
+
+				this.plugin.app.secretStorage.setSecret(this.plugin.settings.kekId, kekBase64);
+				this.plugin.app.secretStorage.setSecret(this.plugin.settings.dekId, newEdek);
+
+				if (this.plugin.hasPassword()) {
+					new Notice(i18n.t('NOTICE_PWD_CHANGED'));
+				} else {
+					new Notice(i18n.t('NOTICE_PWD_SET'));
+				}
+
+				void this.plugin.fetchKeys();
+				this.close();
+			} finally {
+				newKekRaw.fill(0);
+				// 清除明文字符串变量引用
+				this.oldPwd = "";
+				this.newPwd = "";
+			}
+		} catch (error) {
+			console.error(i18n.t('LOG_PWD_SETUP_ERROR'), error);
+			const msg = error instanceof Error ? error.message : String(error);
+			new Notice(msg);
+		}
+	}
+
+	onClose() {
+		this.oldPwd = "";
+		this.newPwd = "";
+		this.contentEl.empty();
+		this.onCloseCallback();
 	}
 }
 
@@ -1258,14 +1890,12 @@ class CryptoSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName(i18n.t('MASTER_KEY'))
 			.setDesc(i18n.t('MASTER_KEY_DESC'))
-			.addComponent(el => {
-				return new SecretComponent(this.app, el)
-					.setValue(this.plugin.settings.secretName)
-					.onChange(async (v: string) => {
-						this.plugin.settings.secretName = v;
-						await this.plugin.saveSettings();
-						await this.plugin.fetchPassword();
-					});
-			});
+			.addButton(btn => btn
+				.setButtonText(this.plugin.hasPassword() ? i18n.t('BTN_CHANGE_PWD') : i18n.t('BTN_SET_PWD'))
+				.onClick(() => {
+					// 激活独立的派生弹窗保护流程
+					new PasswordModal(this.app, this.plugin, () => this.display()).open();
+				})
+			);
 	}
 }
