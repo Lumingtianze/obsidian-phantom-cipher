@@ -526,11 +526,6 @@ class CryptoHelper {
 
 		const compressionFlag = extData?.cp || 0;
 
-		// 无论 cx 校验是否通过，只要解析出了 KID 且不匹配，立即抛出 KID 错误
-		if (extData?.kid && currentKid && extData.kid !== currentKid) {
-			throw new Error(`KID_MISMATCH:${extData.kid}`);
-		}
-
 		// 分块解密
 		const attemptDecryption = async (dek: CryptoKey): Promise<Uint8Array> => {
 			const numChunks = Math.max(1, Math.ceil(combined.byteLength / (CHUNK_SIZE + IV_SIZE + TAG_SIZE)));
@@ -585,7 +580,14 @@ class CryptoHelper {
 			}
 		}
 
-		if (!finalPlaintext) throw new Error(i18n.t('ERR_DECRYPT_FAIL'));
+		// 只有当所有尝试均失败后，才通过 KID 判定是否属于错误的密钥归属
+		if (!finalPlaintext) {
+			if (extData?.kid && currentKid && extData.kid !== currentKid) {
+				throw new Error(`KID_MISMATCH:${extData.kid}`);
+			}
+			throw new Error(i18n.t('ERR_DECRYPT_FAIL'));
+		}
+
 
 		if (compressionFlag === 1) {
 			const compressedBuffer = finalPlaintext; // 暂存压缩态明文
@@ -643,11 +645,9 @@ export default class PhantomCipherPlugin extends Plugin {
 	public vaultEDEK: string | null = null; // 供高频写入拼接使用
 	public vaultKID: string | null = null; // 截取自 KEK 的前 6 位用于快速识别
 
-	private originalRead!: (path: string) => Promise<string>;
 	private originalWrite!: (path: string, data: string, options?: DataWriteOptions) => Promise<void>;
 	private originalReadBinary!: (path: string) => Promise<ArrayBuffer>;
 	private originalWriteBinary!: (path: string, data: ArrayBuffer, options?: DataWriteOptions) => Promise<void>;
-	private originalProcess!: (path: string, fn: (data: string) => string, options?: DataWriteOptions) => Promise<string>;
 	private originalGetResourcePath!: (path: string) => string;
 
 	// 备份 Vault 层原生方法。解密操作移交逻辑层，以遵循官方安全分层规范
@@ -655,6 +655,10 @@ export default class PhantomCipherPlugin extends Plugin {
 	private originalVaultReadBinary!: (file: TFile) => Promise<ArrayBuffer>;
 	private originalVaultCachedRead!: (file: TFile) => Promise<string>;
 
+	// 备份 PDF 原生渲染器生成器
+	private originalCreatePDFViewer?: PDFViewerCreator; 
+
+	private statusDebounceTimer: number | null = null;
 	private statusBarItem!: HTMLElement;
 	private errorThrottler: Map<string, number> = new Map();
 
@@ -735,23 +739,49 @@ export default class PhantomCipherPlugin extends Plugin {
 	}
 
 	/**
-	 * 视口失焦事件处理器。负责在挂起到后台且闲置 10 分钟后主动擦除驻留的密钥对象
+	 * 视口失焦事件处理器。负责在挂起到后台且闲置 5 分钟后主动擦除驻留的密钥对象
 	 */
 	private onVisibilityChange = () => {
-		if (activeDocument.hidden) {
+		const handleInactivity = () => {
+			if (this.visibilityTimeout) return; // 避免重复创建
+
 			this.visibilityTimeout = window.setTimeout(() => {
 				// 擦除内存中的所有加密原材料
 				if (this.secureKEK) { this.secureKEK.clear(); this.secureKEK = null; }
 				if (this.secureDEK) { this.secureDEK.clear(); this.secureDEK = null; }
-			}, 10 * 60 * 1000);
+
+				// 只有计时器真正触发时，才清理 UI 解密状态
+				this.decryptedPaths.clear();
+				this.visibilityTimeout = null;
+
+				// 刷新当前状态栏为红色锁定状态
+				const activeFile = this.app.workspace.getActiveFile();
+				if (activeFile) void this.updateStatusBar(activeFile, true);
+			}, 5 * 60 * 1000);
+		};
+
+		const handleActive = () => {
 			if (this.visibilityTimeout !== null) {
 				window.clearTimeout(this.visibilityTimeout);
 				this.visibilityTimeout = null;
 			}
-			// 重新回到前台时，尝试从 SecretStorage 重新验证与加载
+			// 如果在后台期间密钥已过期被抹除，重新从 SecretStorage 加载
 			if (!this.secureKEK) {
-				void this.fetchKeys();
+				void this.fetchKeys().then(async () => {
+					const activeFile = this.app.workspace.getActiveFile();
+					if (activeFile && this.hasPassword()) {
+						// 重新校验当前活跃文件
+						await this.app.vault.cachedRead(activeFile);
+						void this.updateStatusBar(activeFile, true);
+					}
+				});
 			}
+		};
+
+		if (activeDocument.hidden || !activeDocument.hasFocus()) {
+			handleInactivity();
+		} else {
+			handleActive();
 		}
 	};
 
@@ -772,6 +802,10 @@ export default class PhantomCipherPlugin extends Plugin {
 		// 状态栏初始化
 		this.statusBarItem = this.addStatusBarItem();
 		this.statusBarItem.addClass("phantom-cipher-status-bar");
+
+		// 前台计时器监听
+		this.registerDomEvent(window, 'blur', this.onVisibilityChange);
+		this.registerDomEvent(window, 'focus', this.onVisibilityChange);
 
 		// 功能区图标：手动转换按钮
 		this.addRibbonIcon('lock', i18n.t('RIBBON_TEXT'), () => {
@@ -797,11 +831,9 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		// 拦截并备份原生的 Adapter 方法
 		const adapter = this.app.vault.adapter;
-		this.originalRead = adapter.read.bind(adapter);
 		this.originalWrite = adapter.write.bind(adapter);
 		this.originalReadBinary = adapter.readBinary.bind(adapter);
 		this.originalWriteBinary = adapter.writeBinary.bind(adapter);
-		this.originalProcess = adapter.process.bind(adapter);
 		this.originalGetResourcePath = adapter.getResourcePath.bind(adapter);
 
 		// 备份 Vault 层方法用于挂载解密逻辑，实现物理/逻辑读写分层
@@ -811,7 +843,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		this.originalVaultCachedRead = vault.cachedRead.bind(vault);
 
 		this.hookAdapter();
-		
+
 		this.hookPDFViewer(); // 启动挂载针对 PDF 渲染器原生的底层加载劫持拦截器
 		this.addSettingTab(new CryptoSettingTab(this.app, this));
 
@@ -829,12 +861,29 @@ export default class PhantomCipherPlugin extends Plugin {
 			this.registerDomEvent(workspaceWindow.doc, 'visibilitychange', this.onVisibilityChange);
 		}));
 
+		// 文件删除监听，防止 Blob 资源长期占用内存
+		this.registerEvent(this.app.vault.on('delete', (file) => {
+			if (this.blobUrlCache.has(file.path)) {
+				URL.revokeObjectURL(this.blobUrlCache.get(file.path)!);
+				this.blobUrlCache.delete(file.path);
+				this.blobMtimeCache.delete(file.path);
+			}
+			this.decryptedPaths.delete(file.path);
+		}));
+
 		this.app.workspace.onLayoutReady(() => {
 			void this.fetchKeys().then(() => {
-				// 延迟 500ms 待视图稳定后执行初次预热
-				window.setTimeout(() => {
+				window.setTimeout(async () => {
 					const activeFile = this.app.workspace.getActiveFile();
-					if (activeFile) void this.updateStatusBar(activeFile);
+					if (activeFile) {
+						//如果当前文件是加密的，直接调用 cachedRead 触发底层解密钩子
+						if (this.hasPassword()) {
+							await this.app.vault.cachedRead(activeFile);
+						}
+
+						// 传入 force: true 强制状态栏执行一次探测更新
+						void this.updateStatusBar(activeFile, true);
+					}
 				}, 500);
 			});
 		});
@@ -843,11 +892,8 @@ export default class PhantomCipherPlugin extends Plugin {
 	onunload() {
 		// 插件卸载时还原底层 Adapter 引用
 		const adapter = this.app.vault.adapter;
-		adapter.read = this.originalRead;
 		adapter.write = this.originalWrite;
-		adapter.readBinary = this.originalReadBinary;
 		adapter.writeBinary = this.originalWriteBinary;
-		adapter.process = this.originalProcess;
 		adapter.getResourcePath = this.originalGetResourcePath;
 
 		// 还原逻辑层的方法
@@ -855,6 +901,14 @@ export default class PhantomCipherPlugin extends Plugin {
 		vault.read = this.originalVaultRead;
 		vault.readBinary = this.originalVaultReadBinary;
 		vault.cachedRead = this.originalVaultCachedRead;
+
+		// 清理 PDF 渲染器原生的底层加载劫持残留标识符
+		const targetWindow = window as unknown as ObsidianWindow;
+		if (targetWindow.pdfjsViewer && this.originalCreatePDFViewer) {
+			targetWindow.pdfjsViewer.createObsidianPDFViewer = this.originalCreatePDFViewer;
+			delete this.originalCreatePDFViewer.__phantomHooked;
+			this.originalCreatePDFViewer = undefined;
+		}
 
 		this.clearInternalState();
 
@@ -961,7 +1015,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		const hookApp = (app: ObsidianPDFApp) => {
 			if (app.__phantomHooked) return;
 			const originalOpen = app.open.bind(app);
-			
+
 			app.open = async (args: PDFOpenArgs) => {
 				if (args && args.url && typeof args.url === 'string') {
 					try {
@@ -975,7 +1029,7 @@ export default class PhantomCipherPlugin extends Plugin {
 							if (vaultPath) {
 								// 3. 读取头部签名校验是否为加密文件
 								const rawHead = await this.originalReadBinary(vaultPath).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
-								
+
 								if (this.crypto.isEncrypted(rawHead)) {
 									if (!this.hasPassword()) await this.fetchKeys();
 									if (!this.hasPassword()) {
@@ -988,7 +1042,7 @@ export default class PhantomCipherPlugin extends Plugin {
 									const tKek = await this.getTmpKEK();
 									const tDek = await this.getTmpDEK();
 									const result = await this.crypto.decryptFile(new Uint8Array(rawBuffer), tDek, tKek, this.vaultKID);
-									
+
 									if (result && result.data) {
 										// 5. 将原生入参偷偷替换为解密完的 Uint8Array，然后抛弃 URL
 										// 使 PDF.js 完全打消使用网络 Fetch 跨钩子加载本地文件的企图
@@ -1010,7 +1064,7 @@ export default class PhantomCipherPlugin extends Plugin {
 
 		const targetWindow = window as unknown as ObsidianWindow;
 		let _pdfjsViewer = targetWindow.pdfjsViewer;
-		
+
 		Object.defineProperty(targetWindow, 'pdfjsViewer', {
 			get: () => _pdfjsViewer,
 			set: (val: PDFjsViewer | undefined) => {
@@ -1018,7 +1072,8 @@ export default class PhantomCipherPlugin extends Plugin {
 				if (_pdfjsViewer && _pdfjsViewer.createObsidianPDFViewer) {
 					const originalCreate = _pdfjsViewer.createObsidianPDFViewer;
 					if (!originalCreate.__phantomHooked) {
-						_pdfjsViewer.createObsidianPDFViewer = function(this: unknown, ...args: unknown[]) {
+						this.originalCreatePDFViewer = originalCreate;
+						_pdfjsViewer.createObsidianPDFViewer = function (this: unknown, ...args: unknown[]) {
 							const app = originalCreate.call(this, ...args);
 							hookApp(app); // 针对每一个新的 PDF 标签实例做 Hook 绑定
 							return app;
@@ -1034,7 +1089,8 @@ export default class PhantomCipherPlugin extends Plugin {
 		if (_pdfjsViewer && _pdfjsViewer.createObsidianPDFViewer) {
 			const originalCreate = _pdfjsViewer.createObsidianPDFViewer;
 			if (!originalCreate.__phantomHooked) {
-				_pdfjsViewer.createObsidianPDFViewer = function(this: unknown, ...args: unknown[]) {
+				this.originalCreatePDFViewer = originalCreate;
+				_pdfjsViewer.createObsidianPDFViewer = function (this: unknown, ...args: unknown[]) {
 					const app = originalCreate.call(this, ...args);
 					hookApp(app);
 					return app;
@@ -1327,84 +1383,115 @@ export default class PhantomCipherPlugin extends Plugin {
 		});
 	}
 
-	/**
-	 * 更新状态栏 UI 展示文件的加密状态
+
+	/** 
+	 * 状态栏 UI 渲染逻辑
 	 */
-	private async updateStatusBar(file: TFile | null) {
-		if (!file) {
-			this.statusBarItem.hide();
-			return;
+	private renderStatusUI(isEnc: boolean, isTransparent: boolean) {
+		this.statusBarItem.empty();
+		if (!isEnc) { this.statusBarItem.hide(); return; }
+
+		this.statusBarItem.show();
+		this.statusBarItem.removeClass("is-transparent", "is-locked");
+		const span = this.statusBarItem.createSpan();
+
+		// 解密成功绿色，锁定只读红色
+		if (isTransparent) {
+			this.statusBarItem.addClass("is-transparent");
+			setIcon(span, "unlock");
+		} else {
+			this.statusBarItem.addClass("is-locked");
+			setIcon(span, "lock");
 		}
-		try {
-			// 1. 物理状态检查（仅用于状态标展示）
-			const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
-			const isEnc = this.crypto.isEncrypted(rawHead);
-			// 物理上是加密文件，且必须在“成功解密列表”中，才算“透明”
-			const isTransparent = this.decryptedPaths.has(file.path);
 
-			this.statusBarItem.empty();
-			if (isEnc) {
-				this.statusBarItem.show();
-				this.statusBarItem.removeClass("is-transparent", "is-locked");
-
-				const span = this.statusBarItem.createSpan();
-
-				// 解密成功绿色，锁定只读红色
-				if (isTransparent) {
-					this.statusBarItem.addClass("is-transparent");
-					setIcon(span, "unlock");
-				} else {
-					this.statusBarItem.addClass("is-locked");
-					setIcon(span, "lock");
-				}
-
-				// 移动端仅显示图标，非移动端根据解密实况显示文字
-				if (!Platform.isMobile) {
-					span.createSpan({ text: isTransparent ? i18n.t('STATUS_TRANSPARENT') : i18n.t('STATUS_LOCKED') });
-				}
-			} else {
-				this.statusBarItem.hide();
-			}
-
-			// 2. 预热任务队列：不论笔记本身是否加密，都要预热其中的媒体
-			const warmupTasks: Promise<boolean>[] = [];
-
-			// 如果当前文件本身就是可预览的媒体（如直接打开图片/PDF），先预热它
-			if (PREVIEW_SUPPORTED.has(file.extension.toLowerCase())) {
-				warmupTasks.push(this.warmupFile(file));
-			}
-
-			// 扫描 Markdown 中的所有双链嵌入附件 (Images/PDFs/Videos)
-			const cache = this.app.metadataCache.getFileCache(file);
-			if (cache?.embeds) {
-				for (const embed of cache.embeds) {
-					const embedFile = this.app.metadataCache.getFirstLinkpathDest(embed.link, file.path);
-					if (embedFile instanceof TFile) {
-						warmupTasks.push(this.warmupFile(embedFile));
-					}
-				}
-			}
-
-			// 3. 阻塞等待：确保所有相关的加密附件都已解密并生成 Blob URL
-			if (warmupTasks.length > 0) {
-				let anySuccess = false;
-				for (const task of warmupTasks) {
-					const isGenerated = await task;
-					if (isGenerated) anySuccess = true;
-				}
-
-				// 如果产生了任何一个新解密的映射，触发 DOM 重载以修复媒体错位。
-				if (anySuccess) {
-					this.fixMediaDOM();
-				}
-			}
-
-		} catch (_e) {
-			void _e;
-			this.statusBarItem.hide();
+		// 移动端仅显示图标，非移动端根据解密实况显示文字
+		if (!Platform.isMobile) {
+			span.createSpan({ text: isTransparent ? i18n.t('STATUS_TRANSPARENT') : i18n.t('STATUS_LOCKED') });
 		}
 	}
 
+
+	/**
+	 * 更新状态栏 UI 展示文件的加密状态
+	 */
+	private async updateStatusBar(file: TFile | null, force: boolean = false) {
+		if (this.statusDebounceTimer !== null) window.clearTimeout(this.statusDebounceTimer);
+		if (!file) { this.statusBarItem.hide(); return; }
+
+		// 如果文件已经在解密信任名单中，它必定是加密且已解锁的。
+		if (!force && this.decryptedPaths.has(file.path)) {
+			this.renderStatusUI(true, true);
+			void this.triggerWarmupTasks(file);
+			return;
+		}
+
+		const runUpdate = async () => {
+			try {
+				// 1. 物理状态检查（仅用于状态标展示）
+				const rawHead = await this.originalReadBinary(file.path).then((b: ArrayBuffer) => b.slice(0, MAGIC_HEADER.length));
+				const isEnc = this.crypto.isEncrypted(rawHead);
+				// 物理上是加密文件，且必须在“成功解密列表”中，才算“透明”
+				const isTransparent = this.decryptedPaths.has(file.path);
+
+				this.renderStatusUI(isEnc, isTransparent);
+
+				// 2. 预热任务队列：不论笔记本身是否加密，都要预热其中的媒体
+				if (isEnc || PREVIEW_SUPPORTED.has(file.extension.toLowerCase())) {
+					void this.triggerWarmupTasks(file);
+				}
+			} catch (_e) {
+				void _e;
+				this.statusBarItem.hide();
+			}
+		};
+
+		/**
+		 * 1. 如果是手动转换后的调用（force），立即执行。
+		 * 2. 如果是正常的修改事件，进入 300ms 防抖，防止高频读磁盘。
+		 */
+		if (force) {
+			await runUpdate();
+		} else {
+			this.statusDebounceTimer = window.setTimeout(runUpdate, 300);
+		}
+	}
+
+	/**
+	 * 预热媒体文件
+	 */
+	private async triggerWarmupTasks(file: TFile) {
+		const warmupTasks: Promise<boolean>[] = [];
+
+		// 如果当前文件本身就是可预览的媒体（如直接打开图片/PDF），先预热它
+		if (PREVIEW_SUPPORTED.has(file.extension.toLowerCase())) {
+			warmupTasks.push(this.warmupFile(file));
+		}
+
+		// 扫描 Markdown 中的所有双链嵌入附件 (Images/PDFs/Videos)
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (cache?.embeds) {
+			for (const embed of cache.embeds) {
+				const embedFile = this.app.metadataCache.getFirstLinkpathDest(embed.link, file.path);
+				if (embedFile instanceof TFile) {
+					warmupTasks.push(this.warmupFile(embedFile));
+				}
+			}
+		}
+
+		// 3. 阻塞等待：确保所有相关的加密附件都已解密并生成 Blob URL
+		if (warmupTasks.length > 0) {
+			let anySuccess = false;
+			for (const task of warmupTasks) {
+				const isGenerated = await task;
+				if (isGenerated) anySuccess = true;
+			}
+
+			// 如果产生了任何一个新解密的映射，触发 DOM 重载以修复媒体错位。
+			if (anySuccess) {
+				this.fixMediaDOM();
+			}
+		}
+	}
 
 	/**
 	 * 安全转换机制
@@ -1512,7 +1599,7 @@ export default class PhantomCipherPlugin extends Plugin {
 			}
 
 			// 4. 原子替换：删除原件并重命名副本
-			// 在某些情况 rename 可能会失败，先 remove 再 rename
+			// 在某些情况 rename 可能会失败，先 remove再 rename
 			try {
 				await this.app.vault.adapter.remove(path);
 			} catch (_e) {
@@ -1530,6 +1617,11 @@ export default class PhantomCipherPlugin extends Plugin {
 			// 转换成功后，强制 Obsidian 重新读取并建立索引
 			const file = this.app.vault.getAbstractFileByPath(path);
 			if (file instanceof TFile) {
+				if (action === 'decrypt') {
+					this.decryptedPaths.delete(path);
+				} else {
+					this.decryptedPaths.add(path);
+				}
 				this.app.metadataCache.trigger("changed", file);
 			}
 			return true;
@@ -1563,7 +1655,7 @@ export default class PhantomCipherPlugin extends Plugin {
 		}
 
 		const action = isEnc ? 'decrypt' : 'encrypt';
-		
+
 		// 创建占位 Notice
 		const progressNotice = new Notice(`${i18n.t('NOTICE_CONVERTING')}: ${file.name}...`, 0);
 
@@ -1574,8 +1666,8 @@ export default class PhantomCipherPlugin extends Plugin {
 			progressNotice.hide();
 
 			// 转换成功后，直接替换原占位 Notice 内容
-			new Notice(isEnc 
-				? i18n.t('NOTICE_RESTORED', { name: file.name }) 
+			new Notice(isEnc
+				? i18n.t('NOTICE_RESTORED', { name: file.name })
 				: i18n.t('NOTICE_ENCRYPTED', { name: file.name }), 5000);
 		} catch (e) {
 			progressNotice.hide();
